@@ -1,0 +1,5 @@
+reports/
+__pycache__/
+# training crops (images) are not committed; labels CSVs are
+dataset*/crops/
+*.mp4

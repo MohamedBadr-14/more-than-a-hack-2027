@@ -1,0 +1,7 @@
+# versions the published model (models/ball_svm.pkl) was trained and verified with;
+# scikit-learn must match to unpickle it
+numpy==2.5.4
+opencv-python==5.0.0.93
+scikit-image==0.26.0
+scikit-learn==1.9.1
+scipy==1.18.1
