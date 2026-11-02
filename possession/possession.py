@@ -4,13 +4,14 @@ Dead ball is ignored (v1): every frame after the first confirmed controller is H
 
 1. Ball per frame: the classical tracker (ball_classical/track.py output, det or interp), else the ORIGINAL
    ATD ball (Metrica, BAR-ATH_tactical_atd_original.txt -- the live file now carries our ball in this window).
-2. Control frame: the nearest player is within R of the ball, no opponent is within R, and the ball moves
+2. Near frame: the nearest player is within R of the ball and the nearest opponent is at least MARGIN
+   further away (closer = contested 50/50, no evidence). Control frame: a near frame where the ball moves
    with him: |v_ball - v_player| < V_REL. Velocities are central differences over +/-VEL_HALF frames.
-   Both teams within R = contested, no evidence.
-3. Evidence: control frames where the ball is a tracked detection or ATD fallback. Interpolated balls
-   hold the state but never change it (their path is invented).
+3. Evidence: control frames where the ball is a tracked detection, a gap carried by one player (track.py), or
+   ATD fallback. Interpolated balls hold the state but never change it (their path is invented).
 4. State machine: possession stays with the current team until the other team has K evidence control
-   frames within the last M frames; the label switch is backdated to the first of those frames.
+   frames within the last M frames; the label switch is backdated to the start of the unbroken run of the
+   new team's near frames that holds the first of them (the ball reaching him, before he slows it).
    Before the first confirmation the label is X (the scorer back-fills it).
 
     python possession.py                  # 11185-18684 -> ../data/possession/possession_11185_18684.{csv,mp4}
@@ -18,7 +19,7 @@ Dead ball is ignored (v1): every frame after the first confirmed controller is H
 
 Video legend: team bar + label top left, GT (checking only) next to it. Players: dots by team, controller
 ringed (white ring = evidence frame, grey = interp frame), yellow X = contested. Ball: green = detection,
-orange = interpolated, magenta = ATD fallback.
+orange = interpolated, cyan = attached to a carrier, magenta = ATD fallback.
 """
 import argparse
 import csv
@@ -40,12 +41,13 @@ PITCH = GAMES[GAME]["pitch"]  # metres
 R = 1.5          # m, control radius
 V_REL = 4.0      # m/s, max ball speed relative to the controller
 VEL_HALF = 2     # frames each side for central-difference velocities
+MARGIN = 0.3     # m, nearest opponent must be this much further than the nearest player, else contested
 K, M = 8, 25     # evidence control frames needed within the last M frames to hand over
 HOME, AWAY = 0, 1
 LABEL = "HA"
 
 TEAM_C = {HOME: (160, 60, 20), AWAY: (40, 40, 220)}  # BGR: Barca blue, Athletic red
-BALL_C = {"det": (0, 255, 0), "interp": (0, 165, 255), "atd": (255, 0, 255)}
+BALL_C = {"det": (0, 255, 0), "interp": (0, 165, 255), "carried": (0, 215, 255), "attached": (255, 255, 0), "atd": (255, 0, 255)}
 TEXT, CONTESTED = (255, 255, 255), (0, 255, 255)
 
 
@@ -84,31 +86,41 @@ def velocity(pos):
 
 
 def control(ball_m, players_m, teams):
-    """Per frame: controller slot (-1 none), contested flag, control flag."""
+    """Per frame: nearest slot (-1 none), contested / near / control flags, and for the debug view the
+    distance (m) to the nearest player and nearest opponent, and the relative speed (m/s), NaN if unknown."""
     n = len(ball_m)
     vb, vp = velocity(ball_m), velocity(players_m)
-    slot, contested, ctrl = np.full(n, -1), np.zeros(n, bool), np.zeros(n, bool)
+    slot, contested, near, ctrl = np.full(n, -1), np.zeros(n, bool), np.zeros(n, bool), np.zeros(n, bool)
+    d_near, d_opp, v_rel = np.full(n, np.nan), np.full(n, np.nan), np.full(n, np.nan)
     for t in range(n):
         d = np.hypot(*(players_m[t] - ball_m[t]).T)
         if np.all(np.isnan(d)):
             continue
-        near = d < R
-        if not near.any():
-            continue
         s = int(np.nanargmin(d))
+        opp = d[teams != teams[s]]
+        d_near[t], d_opp[t] = d[s], np.nanmin(opp, initial=np.inf)
+        v_rel[t] = np.hypot(*(vb[t] - vp[t, s]))
+        if d[s] >= R:
+            continue
         slot[t] = s
-        if (teams[near] != teams[s]).any():
+        if d_opp[t] - d[s] < MARGIN:
             contested[t] = True
             continue
-        ctrl[t] = np.hypot(*(vb[t] - vp[t, s])) < V_REL  # NaN velocity -> False
-    return slot, contested, ctrl
+        near[t] = True
+        ctrl[t] = v_rel[t] < V_REL  # NaN velocity -> False
+    return dict(slot=slot, contested=contested, near=near, ctrl=ctrl, d_near=d_near, d_opp=d_opp, v_rel=v_rel)
 
 
-def hand_over(team_ctrl, evidence):
-    """Labels 'H'/'A'/'X' from per-frame controlling team (-1 none) and evidence flags."""
+def hand_over(team_ctrl, evidence, team_near):
+    """Labels 'H'/'A'/'X' from per-frame controlling team, near team (-1 none) and evidence flags.
+
+    Also returns, for the debug view, the hit count of each team per frame (n, 2) and the hand-overs
+    as (confirmed frame, backdated start, team), as indices into the arrays.
+    """
     n = len(team_ctrl)
     labels = np.full(n, "X")
-    state = None
+    counts, events = np.zeros((n, 2), int), []
+    state, switched = None, 0
     hits = {HOME: [], AWAY: []}  # evidence control frames of each team, within the last M frames
     for t in range(n):
         if evidence[t] and team_ctrl[t] >= 0:
@@ -118,13 +130,17 @@ def hand_over(team_ctrl, evidence):
         for team in (HOME, AWAY):
             if team != state and len(hits[team]) >= K:
                 start = hits[team][0]
-                state = team
+                while start - 1 >= switched and team_near[start - 1] == team:
+                    start -= 1
+                state, switched = team, start
                 labels[start:t] = LABEL[team]
+                events.append((t, start, team))
                 hits = {HOME: [], AWAY: []}
                 break
         if state is not None:
             labels[t] = LABEL[state]
-    return labels
+        counts[t] = len(hits[HOME]), len(hits[AWAY])
+    return labels, counts, events
 
 
 def render(args, frames, labels, status, ball_n, players_n, teams, slot, contested, evidence, gt):
@@ -169,28 +185,39 @@ def render(args, frames, labels, status, ball_n, players_n, teams, slot, contest
     print("wrote", path)
 
 
-def main(args):
+def compute(first, last, track):
+    """Everything the labels come from, per frame of first..last (index 0 = frame `first`)."""
     meta_path, raw_path = require(["atd_meta", "atd_raw"])
     orig = raw_path.replace("_atd.txt", "_atd_original.txt")
     if not os.path.exists(orig):
         sys.exit(f"missing {orig}: the fallback must be Metrica's ball, not the spliced file")
     teams = team_of_each_track(meta_path)
-    frames = np.arange(args.first, args.last + 1)
+    frames = np.arange(first, last + 1)
     scale = np.array(PITCH)
 
-    players_n, atd_ball = read_atd(orig, args.first, args.last)
-    status, ball_n = read_track(args.track, args.first, args.last)
+    players_n, atd_ball = read_atd(orig, first, last)
+    status, ball_n = read_track(track, first, last)
     for i in range(len(frames)):
         if status[i] == "none" and not np.isnan(atd_ball[i, 0]):
             status[i], ball_n[i] = "atd", atd_ball[i]
 
-    slot, contested, ctrl = control(ball_n * scale, players_n * scale, teams)
-    evidence = np.array([s in ("det", "atd") for s in status])
-    team_ctrl = np.where(ctrl, teams[np.maximum(slot, 0)], -1)
-    labels = hand_over(team_ctrl, evidence)
+    c = control(ball_n * scale, players_n * scale, teams)
+    evidence = np.array([s in ("det", "carried", "attached", "atd") for s in status])
+    team_of_slot = teams[np.maximum(c["slot"], 0)]
+    team_ctrl = np.where(c["ctrl"], team_of_slot, -1)
+    team_near = np.where(c["near"], team_of_slot, -1)
+    labels, counts, events = hand_over(team_ctrl, evidence, team_near)
 
     with open(os.path.join(MTAH, "evaluation", "gt", f"{GAME}_possession_gt_public.csv")) as f:
-        gt = {int(r["frame"]): r["label"] for r in csv.DictReader(f) if args.first <= int(r["frame"]) <= args.last}
+        gt = {int(r["frame"]): r["label"] for r in csv.DictReader(f) if first <= int(r["frame"]) <= last}
+    return dict(c, frames=frames, teams=teams, players_n=players_n, ball_n=ball_n, status=status, evidence=evidence,
+                team_ctrl=team_ctrl, team_near=team_near, labels=labels, counts=counts, events=events, gt=gt)
+
+
+def main(args):
+    d = compute(args.first, args.last, args.track)
+    frames, labels, status, slot, teams = d["frames"], d["labels"], d["status"], d["slot"], d["teams"]
+    contested, ctrl, evidence = d["contested"], d["ctrl"], d["evidence"]
 
     os.makedirs(args.out_dir, exist_ok=True)
     stem = os.path.join(args.out_dir, f"possession_{args.first}_{args.last}{args.tag}")
@@ -207,21 +234,21 @@ def main(args):
         f.writelines(f"{t},{lab}\n" for t, lab in enumerate(full))
 
     runs = [lab for i, lab in enumerate(labels) if lab in LABEL and (i == 0 or labels[i - 1] != lab)]
-    src = {s: status.count(s) for s in ("det", "interp", "atd", "none")}
+    src = {s: status.count(s) for s in ("det", "interp", "carried", "attached", "atd", "none")}
     print(f"ball source: {src}")
     print(f"control frames {ctrl.sum()} (evidence {(ctrl & evidence).sum()}), contested {contested.sum()}")
     print(f"possessions: {len(runs)} (H {runs.count('H')}, A {runs.count('A')}), "
           f"mean {np.isin(labels, list(LABEL)).sum() / max(len(runs), 1) / FPS:.1f} s, X frames {(labels == 'X').sum()}")
     print("wrote", stem + ".csv", "and", stem + "_submission.csv")
     if not args.no_video:
-        render(args, frames, labels, status, ball_n, players_n, teams, slot, contested, evidence, gt)
+        render(args, frames, labels, status, d["ball_n"], d["players_n"], teams, slot, contested, evidence, d["gt"])
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--first", type=int, default=11185)
     ap.add_argument("--last", type=int, default=18684)
-    ap.add_argument("--track", default=os.path.join(MTAH, "data", "ball_classical", "tracked_11185_18684_batch3hc.csv"))
+    ap.add_argument("--track", default=os.path.join(MTAH, "data", "ball_classical", "strict_r04_gap2_carried", "tracked_11185_18684.csv"))
     ap.add_argument("--out-dir", default=os.path.join(MTAH, "data", "possession"))
     ap.add_argument("--no-video", action="store_true")
     ap.add_argument("--tag", default="", help="suffix for the output names (keeps earlier outputs)")

@@ -32,7 +32,18 @@ approximation of a second-order model: each node keeps the velocity of its own b
     python track.py --no-video                    # numbers only
     python track.py --first 11185 --last 13184    # sub-range of the same run
 
-Video legend: green box = tracked detection, orange circle = interpolated, thin red box = raw top
+3. Boots and carried balls (need ATD player positions, from the original Metrica file; slot ids never used)
+   --boot-mode strict (default): the path is chosen with every candidate, then path detections within BOOT_R
+   of a player become gaps (no other candidate is picked) and are filled like any other gap.
+   Other modes: penalty (BOOT_PEN off the score before path selection), reject (dropped before), off.
+   carried: an interpolated gap whose detections on both sides are within ATTACH_R of one player, followed
+   frame to frame by position, is flagged "carried" (same curve; possession may count it as evidence).
+   --attach (off by default): such gaps, any length the path links, follow the player's ATD position instead.
+   Approved batch3hc output: --boot-mode off --max-gap 25 --no-carried.
+
+Video legend: green box = tracked detection, orange circle = interpolated, orange circle + white dot = carried,
+cyan circle = attached, magenta ring = boot zone (BOOT_R around each ATD player), thin magenta box + "boot" = path
+detection turned into a gap (strict), "before>after" = candidate penalised / rejected, thin red box = raw top
 candidate the tracker rejected, blue circle = ATD ball (Metrica automatic tracking, NOT ground truth).
 """
 import argparse
@@ -51,7 +62,7 @@ FPS = 25
 PITCH = (105.3, 68.0)  # metres, as games.py
 V_MAX = 30.0           # m/s, about the fastest a ball travels
 R0 = 1.0               # m, slack for homography noise / blob centre jitter
-MAX_GAP = 25           # frames (1 s) that may be skipped/interpolated
+MAX_GAP = 50           # frames (2 s) that may be skipped/interpolated
 FREE_RESTART = 125     # frames (5 s) without a ball after which a track may restart anywhere for NEW_TRACK
 BIAS = 0.0             # subtracted from every SVM score; 0.4 / 0.2 / 0.1 dropped too many real balls
                        # (they often score 0.0-0.3 on real footage)
@@ -69,8 +80,18 @@ VEL_SMOOTH = 0.5       # node velocity = VEL_SMOOTH * link velocity + (1 - VEL_S
 INTERP_MODE = "hermite"  # or "linear" (--interp); hermite = curve matching the ball's velocity at both ends
 VEL_FIT = 5            # path detections used to fit the velocity at each end of a gap
 INTERP_VMAX = 20.0     # m/s; hermite curves faster than this anywhere fall back to the straight line
+BOOT_MODE = "strict"   # strict / penalty / reject / off (--boot-mode), see 3. above
+BOOT_R = 0.4           # m; a candidate this close to an ATD player (about body radius) is likely a boot
+BOOT_PEN = 0.5         # penalty mode: subtracted from the SVM score; a ball that fits the path still wins
+CARRIED = True         # flag interpolated gaps carried by one player (--no-carried)
+ATTACH = False         # --attach: such gaps follow the player's ATD position instead, status "attached"
+ATTACH_R = 1.0         # m; detections on both sides of the gap must be this close to the followed player
+FOLLOW_STEP = 0.5      # m/frame (12.5 m/s) the followed player may move; two players within it = ambiguous
+FOLLOW_MISS = 5        # frames the followed player may be missing from the ATD
 
 TRACKED, INTERP, REJECTED, ATD_C, PITCH_C, TEXT = (0, 255, 0), (0, 165, 255), (0, 0, 255), (255, 128, 0), (0, 255, 255), (255, 255, 255)
+ATTACHED = (255, 255, 0)
+BOOT_C, BOOTED = (255, 0, 255), (255, 0, 255)  # boot zone circles; penalised candidates
 
 
 def load_candidates(path):
@@ -80,6 +101,82 @@ def load_candidates(path):
             by_frame[int(r["frame"])].append(dict(bbox=tuple(int(r[k]) for k in ("x1", "y1", "x2", "y2")),
                                                   u=float(r["u"]), v=float(r["v"]), score=float(r["score"])))
     return by_frame
+
+
+def load_players(path, first, last):
+    """ATD player positions in pitch metres, (n_frames, slots, 2), NaN where missing; row 0 = video frame `first`.
+    Slot ids are not used anywhere: they swap between players."""
+    rows = []
+    with open(path) as f:
+        for line in f:
+            fid = int(line[:line.index(":")])
+            if fid - 1 < first:
+                continue
+            if fid - 1 > last:
+                break
+            rows.append([[float(v) for v in g.split(",")[:2]] for g in line.split(":")[1].split(";")])
+    return np.array(rows) * np.array(PITCH)
+
+
+def nearest_player(players, t, first, xy):
+    """(distance m, position) of the ATD player closest to xy (metres) at frame t; (inf, None) if none."""
+    d = np.linalg.norm(players[t - first] - xy, axis=1)
+    if np.all(np.isnan(d)):
+        return np.inf, None
+    i = int(np.nanargmin(d))
+    return float(d[i]), players[t - first, i]
+
+
+def penalise_boots(by_frame, players, first, last):
+    """Penalty / reject mode: lower the score of candidates within BOOT_R of a player, or drop them."""
+    n = 0
+    for t in range(first, last + 1):
+        for c in by_frame.get(t, []):
+            if nearest_player(players, t, first, np.array([c["u"], c["v"]]) * PITCH)[0] < BOOT_R:
+                c["svm"], c["score"] = c["score"], -np.inf if BOOT_MODE == "reject" else c["score"] - BOOT_PEN  # -inf < MIN_SCORE
+                n += 1
+    return n
+
+
+def gap_boots(path, players, first):
+    """Strict mode: remove path detections within BOOT_R of a player, relinking the path across them.
+    Returns the removed frames."""
+    removed = []
+    for t in sorted(path):
+        c, pt, jump = path[t]
+        if nearest_player(players, t, first, np.array([c["u"], c["v"]]) * PITCH)[0] < BOOT_R:
+            c["boot_gap"] = True
+            removed.append(t)
+    for t in removed:
+        _, pt, jump = path.pop(t)
+        for f, (c2, p2, j2) in path.items():
+            if p2 == t:
+                path[f] = (c2, pt, j2 or jump)
+    return removed
+
+
+def follow(players, first, a, b, ball_a, ball_b):
+    """Positions (metres) of the player carrying the ball from path frame a to b, or None.
+
+    Followed by position, frame to frame (never by slot id): the one player within FOLLOW_STEP of where he
+    was; missing for up to FOLLOW_MISS frames holds his last position; two candidates = ambiguous = None.
+    """
+    d, pos = nearest_player(players, a, first, ball_a)
+    if d > ATTACH_R:
+        return None
+    out, miss = [], 0
+    for s in range(a, b + 1):
+        near = np.linalg.norm(players[s - first] - pos, axis=1) <= FOLLOW_STEP * (miss + 1)
+        if near.sum() > 1:
+            return None
+        if near.sum() == 1:
+            pos, miss = players[s - first][near][0], 0
+        else:
+            miss += 1
+            if miss > FOLLOW_MISS:
+                return None
+        out.append(pos)
+    return out if np.linalg.norm(out[-1] - ball_b) <= ATTACH_R else None
 
 
 def best_path(by_frame, first, last):
@@ -156,23 +253,43 @@ def best_path(by_frame, first, last):
     return path
 
 
-def build_track(path, matrices, project, first, last):
-    """Per-frame dict: status det/interp/none, u, v (normalised), px (x, y), score, bbox."""
+def build_track(path, matrices, project, first, last, players=None):
+    """Per-frame dict: status det/interp/carried/attached/none, u, v (normalised), px (x, y), score, bbox.
+
+    attached: a gap (any length the path links, not a jump) whose detections on both sides sit at the same
+    position-followed player; the ball keeps its offset from him, blended linearly from one end to the other.
+    """
     track = {t: dict(status="none") for t in range(first, last + 1)}
     frames = sorted(path)
+    scale = np.array(PITCH)
     for t, (c, pt, jump) in path.items():
         x1, y1, x2, y2 = c["bbox"]
         track[t] = dict(status="det", u=c["u"], v=c["v"], px=((x1 + x2) / 2, (y1 + y2) / 2), score=c["score"], bbox=c["bbox"])
+        if ATTACH and players is not None and pt is not None and not jump and t - pt > 1:
+            a = path[pt][0]
+            ball_a, ball_b = np.array([a["u"], a["v"]]) * scale, np.array([c["u"], c["v"]]) * scale
+            carrier = follow(players, first, pt, t, ball_a, ball_b)
+            if carrier is not None:
+                off_a, off_b = ball_a - carrier[0], ball_b - carrier[-1]
+                for s in range(pt + 1, t):
+                    w = (s - pt) / (t - pt)
+                    u, v = (carrier[s - pt] + off_a + w * (off_b - off_a)) / scale
+                    track[s] = dict(status="attached", u=float(u), v=float(v), px=tuple(float(z) for z in project(matrices[s], u, v)))
+                continue
         if pt is not None and not jump and 1 < t - pt <= MAX_GAP + 1:  # jumps and long gaps stay "no ball"
             a = path[pt][0]
             curve = hermite(path, frames, pt, t) if INTERP_MODE == "hermite" else None
+            status = "interp"
+            if CARRIED and players is not None and follow(players, first, pt, t, np.array([a["u"], a["v"]]) * scale,
+                                                          np.array([c["u"], c["v"]]) * scale) is not None:
+                status = "carried"
             for s in range(pt + 1, t):
                 if curve is not None:
                     u, v = curve[s - pt - 1]
                 else:
                     w = (s - pt) / (t - pt)
                     u, v = a["u"] + w * (c["u"] - a["u"]), a["v"] + w * (c["v"] - a["v"])
-                track[s] = dict(status="interp", u=u, v=v, px=tuple(float(z) for z in project(matrices[s], u, v)))
+                track[s] = dict(status=status, u=u, v=v, px=tuple(float(z) for z in project(matrices[s], u, v)))
     return track
 
 
@@ -222,8 +339,8 @@ def hermite(path, frames, a, b):
 
 def raw_top(by_frame, t):
     cs = by_frame.get(t, [])
-    best = max(cs, key=lambda c: c["score"]) if cs else None
-    return best if best and best["score"] > 0 else None
+    best = max(cs, key=lambda c: c.get("svm", c["score"])) if cs else None  # svm = score before the boot penalty
+    return best if best and best.get("svm", best["score"]) > 0 else None
 
 
 def summarise(ref, by_frame, track):
@@ -249,13 +366,22 @@ def summarise(ref, by_frame, track):
               f"{rate(sum(agrees(out[t], ref[t]) for t in atd), len(atd)):>22s} "
               f"{rate(sum(agrees(out[t], ref[t]) for t in outs_atd), len(outs_atd)):>22s}")
     n_interp = sum(track[t]["status"] == "interp" for t in ref)
+    n_attached = sum(track[t]["status"] == "attached" for t in ref)
+    n_carried = sum(track[t]["status"] == "carried" for t in ref)
     changed = sum(1 for t in ref if raw_top(by_frame, t) is not None and
                   (track[t]["status"] != "det" or track[t]["bbox"] != raw_top(by_frame, t)["bbox"]))
-    print(f"\ninterpolated frames: {n_interp}   raw top-1 replaced/removed by tracker: {changed}")
+    print(f"\ninterpolated frames: {n_interp + n_carried} (carried {n_carried})   attached frames: {n_attached}   raw top-1 replaced/removed by tracker: {changed}")
     print("(ATD = Metrica automatic tracking, not ground truth: 'agrees' is agreement, not accuracy)")
 
 
-def render(args, track, by_frame, ref, matrices, LH, OV):
+def boot_ring(frame, H, xy, project):
+    """BOOT_R circle around a player (pitch metres), projected to pixels."""
+    pts = [project(H, (xy[0] + BOOT_R * np.cos(a)) / PITCH[0], (xy[1] + BOOT_R * np.sin(a)) / PITCH[1])
+           for a in np.linspace(0, 2 * np.pi, 16, endpoint=False)]
+    cv2.polylines(frame, [np.array(pts).round().astype(np.int32)], True, BOOT_C, 1, cv2.LINE_AA)
+
+
+def render(args, track, by_frame, ref, matrices, LH, OV, players=None):
     print(f"rendering video, skipping to frame {args.first} ...")
     cap = OV.open_video_at(args.first)
     w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -267,6 +393,19 @@ def render(args, track, by_frame, ref, matrices, LH, OV):
         if not ok:
             break
         cv2.polylines(frame, [np.array(LH.pitch_corners(matrices[t])).round().astype(np.int32)], True, PITCH_C, 1, cv2.LINE_AA)
+        if players is not None and BOOT_MODE != "off":
+            for xy in players[t - args.first]:
+                if not np.isnan(xy[0]):
+                    boot_ring(frame, matrices[t], xy, LH.project)
+            for c in by_frame.get(t, []):
+                if c.get("boot_gap"):  # strict: path detection turned into a gap
+                    x1, y1, x2, y2 = c["bbox"]
+                    cv2.rectangle(frame, (x1 - 3, y1 - 3), (x2 + 3, y2 + 3), BOOTED, 1)
+                    cv2.putText(frame, "boot", (x2 + 5, y1), cv2.FONT_HERSHEY_SIMPLEX, 0.4, BOOTED, 1, cv2.LINE_AA)
+                if "svm" in c:  # penalised: thin magenta box + its score before -> after
+                    x1, y1, x2, y2 = c["bbox"]
+                    cv2.rectangle(frame, (x1 - 3, y1 - 3), (x2 + 3, y2 + 3), BOOTED, 1)
+                    cv2.putText(frame, f"{c['svm']:.2f}>{c['score']:.2f}", (x2 + 5, y1), cv2.FONT_HERSHEY_SIMPLEX, 0.4, BOOTED, 1, cv2.LINE_AA)
         r = ref.get(t)
         if r and r["atd_x"] != "":
             cv2.circle(frame, (int(float(r["atd_x"])), int(float(r["atd_y"]))), 14, ATD_C, 2)
@@ -277,8 +416,10 @@ def render(args, track, by_frame, ref, matrices, LH, OV):
         if tr["status"] == "det":
             x1, y1, x2, y2 = tr["bbox"]
             cv2.rectangle(frame, (x1 - 6, y1 - 6), (x2 + 6, y2 + 6), TRACKED, 2)
-        elif tr["status"] == "interp":
-            cv2.circle(frame, (int(tr["px"][0]), int(tr["px"][1])), 10, INTERP, 2)
+        elif tr["status"] in ("interp", "carried", "attached"):
+            cv2.circle(frame, (int(tr["px"][0]), int(tr["px"][1])), 10, ATTACHED if tr["status"] == "attached" else INTERP, 2)
+            if tr["status"] == "carried":
+                cv2.circle(frame, (int(tr["px"][0]), int(tr["px"][1])), 3, TEXT, -1)
         status = f"frame {t}  GT {r['gt'] if r else 'X'}  BALL {tr['status'].upper()}" + \
                  (f" {tr['score']:.2f}" if tr["status"] == "det" else "") + ("  (raw pick rejected)" if raw is not None and (tr["status"] != "det" or tr["bbox"] != raw["bbox"]) else "")
         cv2.rectangle(frame, (0, 1040), (900, 1080), (0, 0, 0), -1)
@@ -303,9 +444,18 @@ def main(args):
     with open(stem + ".csv") as f:
         ref = {int(r["frame"]): r for r in csv.DictReader(f) if args.first <= int(r["frame"]) <= args.last}
     matrices, _, _ = LH.load()
+    from games import require
+    players = None
+    if BOOT_MODE != "off" or ATTACH or CARRIED:
+        # Metrica's original ATD: the live file carries our own ball in the public window (players identical)
+        players = load_players(require(["atd_raw"])[0].replace("_atd.txt", "_atd_original.txt"), args.first, args.last)
+    if BOOT_MODE in ("penalty", "reject"):
+        print(f"boot {'rejected' if BOOT_MODE == 'reject' else 'penalty on'} {penalise_boots(by_frame, players, args.first, args.last)} candidates")
 
     path = best_path(by_frame, args.first, args.last)
-    track = build_track(path, matrices, LH.project, args.first, args.last)
+    if BOOT_MODE == "strict":
+        print(f"boot strict: {len(gap_boots(path, players, args.first))} path detections turned into gaps")
+    track = build_track(path, matrices, LH.project, args.first, args.last, players)
 
     with open(os.path.join(args.out_dir, f"tracked_{args.first}_{args.last}{args.tag}.csv"), "w", newline="") as f:
         wr = csv.writer(f)
@@ -316,7 +466,7 @@ def main(args):
                                                f"{tr['score']:.3f}" if "score" in tr else ""] if tr["status"] != "none" else [""] * 5))
     summarise(ref, by_frame, track)
     if not args.no_video:
-        render(args, track, by_frame, ref, matrices, LH, OV)
+        render(args, track, by_frame, ref, matrices, LH, OV, players)
 
 
 if __name__ == "__main__":
@@ -331,7 +481,14 @@ if __name__ == "__main__":
     ap.add_argument("--tag", default="", help="suffix for the output names, e.g. _skip0 (keeps earlier outputs)")
     ap.add_argument("--interp", choices=["linear", "hermite"], default=INTERP_MODE)
     ap.add_argument("--vel-w", type=float, default=VEL_W, help="velocity-change penalty per m/s (0 = off)")
+    ap.add_argument("--boot-mode", choices=["strict", "penalty", "reject", "off"], default=BOOT_MODE)
+    ap.add_argument("--boot-pen", type=float, default=BOOT_PEN, help="penalty mode: score penalty near an ATD player")
+    ap.add_argument("--max-gap", type=int, default=MAX_GAP, help="longest gap (frames) filled by interpolation")
+    ap.add_argument("--boot-r", type=float, default=BOOT_R, help="boot zone radius around a player, m")
+    ap.add_argument("--no-carried", action="store_true", help="don't flag gaps carried by one player")
+    ap.add_argument("--attach", action="store_true", help="carried gaps follow the player's ATD position")
     a = ap.parse_args()
-    INTERP_MODE, VEL_W = a.interp, a.vel_w
+    INTERP_MODE, VEL_W, BOOT_MODE, BOOT_PEN, BOOT_R = a.interp, a.vel_w, a.boot_mode, a.boot_pen, a.boot_r
+    MAX_GAP, ATTACH, CARRIED = a.max_gap, a.attach, not a.no_carried
     a.out_dir = a.out_dir or os.path.join(a.mtah, "data", "ball_classical")
     main(a)
