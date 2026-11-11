@@ -14,11 +14,20 @@ ball to the nearest player (team colour) and nearest opponent (yellow), dashed c
 Ball: green = detection, orange = interpolated, cyan = attached to a carrier, magenta = ATD fallback.
 Timeline rows: ours, GT, ball source, near (team of the nearest player when near; yellow = contested),
 evidence (team colour where a control frame counts towards a hand-over), hits (count of the team that is
-NOT in possession, out of K; filled at K = hand-over). White line = hand-over confirmed, dashed = where
-it was backdated to.
+NOT in possession, out of K; filled at K = hand-over). White line = hand-over confirmed, dashed = where it
+was backdated to.
+
+--layout touch (touches.py only): video with the touches.R circle, lines to players within it, ball speed,
+event / hold labels; panel = (1) ball change at this frame (speed in/out, turn, tests, in/out arrows),
+(2) nearest of each team, (3) result; timeline rows: ball source, speed, change (firing frames), event
+(team colour, yellow = contested, low grey = unknown; white tick = its moment), hold.
+
+--layout v3 (possession_v3.py): the touch layout plus ours / GT rows on top of the timeline, white line =
+possession change confirmed (2nd touch / hold), dashed = the change point (first touch), and an ours / GT
+box with a change banner in the panel. Outer grey circle = touches.R_FAR.
 
 Viewer keys: space pause/play, right/left (or d/a) step one frame, n/p next/previous hand-over,
-m/M next/previous disagreement with GT, g go to frame (typed in the terminal), +/- speed, q quit.
+m/M next/previous disagreement with GT, t/T next/previous touch, b/B next/previous bounce-flagged touch, g go to frame (typed in the terminal), +/- speed, q quit.
 """
 import argparse
 import csv
@@ -30,6 +39,8 @@ import cv2
 import numpy as np
 
 import possession as P
+import possession_v3 as V3
+import touches as T
 
 W, H = 1920, 1080
 VID_W, VID_H = 1440, 810
@@ -40,6 +51,8 @@ ROW_H = 36
 LABEL_C = {"H": P.TEAM_C[P.HOME], "A": P.TEAM_C[P.AWAY], "D": (110, 110, 110), "X": (45, 45, 45)}
 WHITE, GREY, YELLOW, DARK = (255, 255, 255), (128, 128, 128), (0, 255, 255), (25, 25, 25)
 FONT = cv2.FONT_HERSHEY_SIMPLEX
+BOUNCE_C = (255, 0, 255)  # touch flagged as a possible bounce
+TOUCH_STYLE = {"touch": None, "hold": None, "contested": (0, 255, 255), "unknown": (128, 128, 128)}  # None = team colour
 
 
 def text(img, s, xy, scale=0.6, colour=WHITE, thick=1):
@@ -191,7 +204,210 @@ def timeline(canvas, d, i):
     text(canvas, "+5 s", (W - 50, H - 8), 0.45, GREY)
 
 
-def compose(frame, d, i, Hm, LH):
+def outlined(img, s, xy, scale, colour, thick=2):
+    cv2.putText(img, s, xy, FONT, scale, (0, 0, 0), thick + 3, cv2.LINE_AA)
+    cv2.putText(img, s, xy, FONT, scale, colour, thick, cv2.LINE_AA)
+
+
+def ev_label(e):
+    team = {T.BOTH: "both", T.NONE: "?"}.get(e["team"]) or P.LABEL[e["team"]]
+    colour = TOUCH_STYLE[e["kind"]] or P.TEAM_C[e["team"]]
+    if e.get("bounce") and e["kind"] == "touch":
+        colour = BOUNCE_C
+    return f"{e['kind'].upper()} {team}" + (" far" if e.get("far") else "") + (" ? bounce" if e.get("bounce") else ""), colour
+
+
+def touch_overlay(frame, d, i, Hm, LH):
+    """Touch layout: players, the R circle, lines to the players within R, ball speed, event / hold labels."""
+    b = d["ball_n"][i]
+    teams = d["teams_f"][i] if "teams_f" in d else d["teams"]
+    px = {}
+    for s, uv in enumerate(d["players_n"][i]):
+        if not np.isnan(uv[0]):
+            px[s] = tuple(int(round(c)) for c in LH.project(Hm, *uv))
+            cv2.circle(frame, px[s], 5, P.TEAM_C[teams[s]], -1)
+    if np.isnan(b[0]):
+        return
+    bp = tuple(int(round(c)) for c in LH.project(Hm, *b))
+    dist = np.hypot(*((d["players_n"][i] - b) * P.PITCH).T)
+    for s in np.flatnonzero(dist < T.R):
+        if s in px:
+            cv2.line(frame, bp, px[s], P.TEAM_C[teams[s]], 2, cv2.LINE_AA)
+            cv2.circle(frame, px[s], 12, WHITE, 2)
+    for r, colour in ((T.R, YELLOW), (T.R_FAR, GREY)):
+        ring = [LH.project(Hm, b[0] + r * np.cos(a) / P.PITCH[0], b[1] + r * np.sin(a) / P.PITCH[1])
+                for a in np.linspace(0, 2 * np.pi, 24, endpoint=False)]
+        for k in range(0, 24, 2):
+            cv2.line(frame, tuple(int(c) for c in ring[k]), tuple(int(c) for c in ring[k + 1]), colour, 1, cv2.LINE_AA)
+    cv2.circle(frame, bp, 9, P.BALL_C[d["status"][i]], 2)
+    outlined(frame, f"{fmt(d['tinfo']['speed'][i]).strip()} m/s", (bp[0] + 14, bp[1] + 26), 0.6, WHITE, 1)
+    y = bp[1] - 14
+    for key in ("eidx", "hidx"):
+        k = d[key][i]
+        if k >= 0:
+            e = d["touches"][k]
+            label, colour = ev_label(e)
+            outlined(frame, label, (bp[0] + 14, y), 0.8, colour)
+            y -= 30
+
+
+def touch_panel(canvas, d, i):
+    """Touch layout: (1) does the ball change at this frame, (2) who is within R, (3) the result."""
+    x, y = PANEL_X + 16, 44
+    ti = d["tinfo"]
+    text(canvas, f"frame {d['frames'][i]}", (x, y), 0.7, WHITE, 2)
+    y += 30
+    text(canvas, f"ball: {d['status'][i]}   speed now {fmt(ti['speed'][i])} m/s", (x, y), 0.6)
+    y += 44
+    ek, hk = d["eidx"][i], d["hidx"][i]
+    e = d["touches"][ek] if ek >= 0 else None
+    shown = e or (d["touches"][hk] if hk >= 0 else None)
+    label, colour = ev_label(shown) if shown else ("no touch", GREY)
+    cv2.rectangle(canvas, (x - 6, y - 30), (W - 16, y + 12), colour, -1)
+    text(canvas, label, (x + 4, y), 0.85, WHITE if shown and shown["kind"] != "unknown" else DARK, 2)
+    y += 50
+
+    text(canvas, "1. ball change at this frame", (x, y), 0.6, WHITE, 2)
+    y += 28
+    text(canvas, f"   speed in {fmt(ti['s_in'][i])} -> out {fmt(ti['s_out'][i])} m/s", (x, y), 0.6)
+    y += 26
+    turn = ti["turn"][i]
+    text(canvas, f"   turn {turn:.0f} deg" if np.isfinite(turn) else "   turn  -", (x, y), 0.6)
+    y += 30
+    tests = [(f"turn    >= {T.TURN:g} deg, >= {T.MIN_SPEED:g} m/s, holds after", "turn"),
+             (f"slow    in >= {T.SLOW_IN:g}, out <= {T.SLOW_FRAC:g} x in", "slow down"),
+             (f"kick    in < {T.KICK_IN:g}, out >= {T.KICK_OUT:g} m/s", "kick from slow")]
+    for s, key in tests:
+        ok = bool(ti["tests"][key][i])
+        text(canvas, ("   OK  " if ok else "   --  ") + s, (x, y), 0.52, (80, 220, 80) if ok else GREY, 2 if ok else 1)
+        y += 26
+    y += 14
+
+    text(canvas, f"2. who: nearest within {T.R:g} m (else {T.R_FAR:g} m = far)", (x, y), 0.6, WHITE, 2)
+    y += 28
+    for team, name in ((P.HOME, "Barca"), (P.AWAY, "Athletic")):
+        dm = ti["d_team"][i, team]
+        ok = dm < T.R_FAR
+        text(canvas, f"   {name:9s} {fmt(dm)} m", (x, y), 0.6, P.TEAM_C[team] if ok else GREY, 2 if ok else 1)
+        y += 26
+    y += 14
+
+    text(canvas, "3. result", (x, y), 0.6, WHITE, 2)
+    y += 28
+    if e:
+        f = d["frames"]
+        text(canvas, f"   ball event {f[e['a']]}-{f[e['b']]}, moment {f[e['t']]}", (x, y), 0.52)
+        y += 26
+        text(canvas, f"   by: {e['why']}", (x, y), 0.52)
+        y += 26
+        text(canvas, f"   change vs line of sight |cos| {fmt(e['los_cos'])} (bounce flag >= {T.BOUNCE_COS:g})", (x, y), 0.52,
+             BOUNCE_C if e["bounce"] else GREY)
+        y += 26
+        text(canvas, f"   nearest H {fmt(e['d_h'])}  A {fmt(e['d_a'])} m -> {label}", (x, y), 0.52, colour, 1)
+        y += 26
+    if hk >= 0:
+        h = d["touches"][hk]
+        text(canvas, f"   hold {d['frames'][h['a']]}-{d['frames'][h['b']]} ({h['why']})", (x, y), 0.52,
+             P.TEAM_C[h["team"]], 2)
+        y += 26
+    if not e and hk < 0:
+        text(canvas, "   no ball change, no hold", (x, y), 0.52, GREY)
+    arrows(canvas, ti["v_in"][i], ti["v_out"][i], (PANEL_X + 400, 300))
+    if "v3" in d:
+        poss_block(canvas, d, i, x, 670)
+
+
+def poss_block(canvas, d, i, x, y):
+    """v3 layout: our label vs GT, and a banner for 3 s after a possession change is confirmed."""
+    lab, gt = d["labels"][i], d["gt"].get(int(d["frames"][i]), "X")
+    cv2.rectangle(canvas, (x - 6, y - 26), (x + 200, y + 10), LABEL_C[lab], -1)
+    text(canvas, f"OURS {lab}", (x + 4, y), 0.75, WHITE, 2)
+    cv2.rectangle(canvas, (x + 234, y - 26), (x + 440, y + 10), LABEL_C[gt], -1)
+    text(canvas, f"GT {gt}", (x + 244, y), 0.75, WHITE, 2)
+    recent = [e for e in d["events"] if 0 <= i - e[0] < 3 * P.FPS]
+    if recent:
+        conf, start, team = recent[-1]
+        f = d["frames"]
+        cv2.rectangle(canvas, (x - 6, y + 22), (W - 16, y + 80), P.TEAM_C[team], -1)
+        text(canvas, f"CHANGE -> {P.LABEL[team]} from {f[start]} (first touch)", (x + 4, y + 44), 0.55, WHITE, 2)
+        text(canvas, f"confirmed {f[conf]} (2nd touch / hold)", (x + 4, y + 70), 0.55, WHITE, 1)
+
+
+def arrows(canvas, vin, vout, c):
+    """Ball direction in (grey) and out (white) at this frame, both from the centre (angle between = turn),
+    length by speed, pitch seen from above."""
+    cv2.circle(canvas, c, 55, (60, 60, 60), 1)
+    for v, colour, name in ((vin, GREY, "in"), (vout, WHITE, "out")):
+        sp = np.hypot(*v)
+        if not np.isfinite(sp) or sp < 0.1:
+            continue
+        L = 15 + 35 * min(sp, 25) / 25
+        tip = (int(c[0] + v[0] / sp * L), int(c[1] + v[1] / sp * L))
+        cv2.arrowedLine(canvas, c, tip, colour, 2, cv2.LINE_AA, tipLength=0.2)
+        text(canvas, name, (tip[0] + (6 if v[0] >= 0 else -30), tip[1] + (16 if v[1] >= 0 else -6)), 0.5, colour)
+
+
+def touch_timeline(canvas, d, i):
+    """Touch layout rows: ball source, ball speed, ball change (firing frames), events, holds.
+    v3 layout: ours and GT rows on top, white line = change confirmed, dashed = change point."""
+    n = len(d["frames"])
+    pxf = (W - TL_X0 - 10) / (2 * HALF + 1)
+    poss = "v3" in d
+    r0, row_h = (2, 36) if poss else (0, 48)
+    cv2.rectangle(canvas, (0, VID_H), (W, H), DARK, -1)
+    names = (["ours", "GT"] if poss else []) + ["ball", "speed", "change", "event", "hold"]
+    for r, name in enumerate(names):
+        text(canvas, name, (10, TL_Y0 + r * row_h + row_h - 14), 0.6)
+    src_c = dict(P.BALL_C, none=(45, 45, 45))
+    ti = d["tinfo"]
+    for k in range(-HALF, HALF + 1):
+        j = i + k
+        if not 0 <= j < n:
+            continue
+        x1, x2 = int(TL_X0 + (k + HALF) * pxf), int(TL_X0 + (k + HALF + 1) * pxf)
+
+        def cell(row, colour, frac=1.0):
+            y2 = TL_Y0 + (r0 + row) * row_h + row_h - 8
+            cv2.rectangle(canvas, (x1, int(y2 - (row_h - 8) * frac)), (x2, y2), colour, -1)
+
+        if poss:
+            cell(-2, LABEL_C[d["labels"][j]])
+            cell(-1, LABEL_C[d["gt"].get(int(d["frames"][j]), "X")])
+        cell(0, (0, 0, 255) if ti["cut"][j] and d["status"][j] != "none" else src_c[d["status"][j]], 0.5)
+        if np.isfinite(ti["speed"][j]):
+            cell(1, (200, 200, 200), min(ti["speed"][j], 25) / 25)
+        if ti["fire"][j]:
+            cell(2, (80, 220, 80))
+        for row, key in ((3, "eidx"), (4, "hidx")):
+            if d[key][j] >= 0:
+                e = d["touches"][d[key][j]]
+                cell(row, ev_label(e)[1], 0.35 if e["kind"] == "unknown" else 1.0)
+    for e in d["touches"]:  # white tick at each event's moment
+        if e["kind"] != "hold" and abs(e["t"] - i) <= HALF:
+            xs = int(TL_X0 + (e["t"] - i + HALF + 0.5) * pxf)
+            cv2.line(canvas, (xs, TL_Y0 + (r0 + 3) * row_h), (xs, TL_Y0 + (r0 + 4) * row_h - 8), WHITE, 2)
+    y_bot = TL_Y0 + len(names) * row_h
+    if poss:
+        for conf, start, team in d["events"]:
+            for f, dashed in ((conf, False), (start, True)):
+                if abs(f - i) <= HALF:
+                    xs = int(TL_X0 + (f - i + HALF + 0.5) * pxf)
+                    for y in range(TL_Y0, y_bot, 8 if dashed else y_bot):
+                        cv2.line(canvas, (xs, y), (xs, min(y + (4 if dashed else y_bot), y_bot)), WHITE, 2)
+    xc = int(TL_X0 + (HALF + 0.5) * pxf)
+    cv2.line(canvas, (xc, TL_Y0 - 6), (xc, y_bot), YELLOW, 1)
+    text(canvas, "-5 s", (TL_X0, H - 6), 0.45, GREY)
+    text(canvas, "+5 s", (W - 50, H - 6), 0.45, GREY)
+
+
+def compose(frame, d, i, Hm, LH, layout="full"):
+    if layout in ("touch", "v3"):
+        touch_overlay(frame, d, i, Hm, LH)
+        canvas = np.zeros((H, W, 3), np.uint8)
+        canvas[:VID_H, :VID_W] = cv2.resize(frame, (VID_W, VID_H), interpolation=cv2.INTER_AREA)
+        touch_panel(canvas, d, i)
+        touch_timeline(canvas, d, i)
+        return canvas
     overlay(frame, d, i, Hm, LH)
     canvas = np.zeros((H, W, 3), np.uint8)
     canvas[:VID_H, :VID_W] = cv2.resize(frame, (VID_W, VID_H), interpolation=cv2.INTER_AREA)
@@ -208,7 +424,14 @@ def stem(args):
 def render(args):
     import load_homography as LH
     import overlay as OV
-    d = P.compute(args.first, args.last, args.track)
+    if args.layout == "v3":
+        d = V3.compute(args.first, args.last, args.track)
+        d["v3"] = True
+    else:
+        d = P.compute(args.first, args.last, args.track)
+        d["touches"], d["tinfo"] = T.touches(d)
+    d["eidx"] = T.per_frame(d["touches"], len(d["frames"]), ("touch", "contested", "unknown"))
+    d["hidx"] = T.per_frame(d["touches"], len(d["frames"]), ("hold",))
     labels, gt_lab = d["labels"], np.array([d["gt"].get(int(t), "X") for t in d["frames"]])
     os.makedirs(args.out_dir, exist_ok=True)
     with open(stem(args) + "_marks.csv", "w", newline="") as f:
@@ -219,6 +442,11 @@ def render(args):
         bad = (labels != gt_lab) & (gt_lab != "X")
         for j in np.flatnonzero(bad & ~np.concatenate(([False], bad[:-1]))):
             wr.writerow(["mismatch", int(d["frames"][j])])
+        for e in d["touches"]:
+            if e["kind"] != "unknown":
+                wr.writerow(["touch", int(d["frames"][e["t"]])])
+            if e["kind"] == "touch" and e["bounce"]:
+                wr.writerow(["bounce", int(d["frames"][e["t"]])])
     matrices, _, _ = LH.load()
     print(f"rendering, skipping to frame {args.first} ...")
     cap = OV.open_video_at(args.first)
@@ -229,7 +457,7 @@ def render(args):
         ok, frame = cap.read()
         if not ok:
             break
-        writer.write(compose(frame, d, i, matrices[t], LH))
+        writer.write(compose(frame, d, i, matrices[t], LH, args.layout))
         if (i + 1) % 500 == 0:
             fps = (i + 1) / (time.time() - started)
             print(f"  {i + 1}/{len(d['frames'])} frames  {fps:.1f} fps  ~{(len(d['frames']) - i - 1) / fps / 60:.0f} min left")
@@ -244,7 +472,7 @@ def view(args):
     if not cap.isOpened():
         sys.exit(f"cannot open {path}: run 'render' first")
     n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    marks = {"handover": [], "mismatch": []}
+    marks = {"handover": [], "mismatch": [], "touch": [], "bounce": []}
     if os.path.exists(stem(args) + "_marks.csv"):
         with open(stem(args) + "_marks.csv") as f:
             for r in csv.DictReader(f):
@@ -276,12 +504,14 @@ def view(args):
             target = i + 1
         elif key in (2424832, ord("a")):
             target = i - 1
-        elif key in (ord("n"), ord("p"), ord("m"), ord("M")):
-            lst = marks["handover" if key in (ord("n"), ord("p")) else "mismatch"]
-            fwd = key in (ord("n"), ord("m"))
-            cand = [f for f in lst if (f > i + 2 * P.FPS if fwd else f < i - 2 * P.FPS)]
+        elif key in (ord("n"), ord("p"), ord("m"), ord("M"), ord("t"), ord("T"), ord("b"), ord("B")):
+            kind = {"n": "handover", "p": "handover", "m": "mismatch", "M": "mismatch",
+                    "b": "bounce", "B": "bounce"}.get(chr(key), "touch")
+            fwd = key in (ord("n"), ord("m"), ord("t"), ord("b"))
+            lead = P.FPS // 2 if kind in ("touch", "bounce") else 2 * P.FPS  # land 0.5 s / 2 s before it
+            cand = [f for f in marks[kind] if (f > i + lead if fwd else f < i - lead)]
             if cand:
-                target = (min(cand) if fwd else max(cand)) - 2 * P.FPS  # land 2 s before it
+                target = (min(cand) if fwd else max(cand)) - lead
         elif key == ord("g"):
             try:
                 target = int(input("go to frame: ")) - args.first
@@ -305,5 +535,7 @@ if __name__ == "__main__":
     ap.add_argument("--track", default=os.path.join(P.MTAH, "data", "ball_classical", "strict_r04_gap2_carried", "tracked_11185_18684.csv"))
     ap.add_argument("--out-dir", default=os.path.join(P.MTAH, "data", "possession"))
     ap.add_argument("--tag", default="_v2")
+    ap.add_argument("--layout", choices=["full", "touch", "v3"], default="full",
+                    help="touch = only what decides a touch (ball, reach, tests, touch row); v3 = touch + possession v3")
     a = ap.parse_args()
     render(a) if a.mode == "render" else view(a)
