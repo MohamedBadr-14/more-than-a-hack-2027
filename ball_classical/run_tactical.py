@@ -65,18 +65,33 @@ def load_yolo(path):
     return out
 
 
-def detect(frame, H, model, threshold, project, unproject):
+def detect(frame, H, model, threshold, project, unproject, out_uv=(0.0, 0.0)):
+    """out_uv: extra band (normalised u, v) beyond the lines in which candidates are kept with off=True (the ball
+    going out of play); (0, 0) = in-field only. The per-frame best (det) is chosen among in-field candidates."""
     poly = np.array([project(H, x, y) for x, y in [(0, 0), (1, 0), (1, 1), (0, 1)]], np.float64)
-    pm = np.zeros(frame.shape[:2], np.uint8)
-    cv2.fillPoly(pm, [poly.round().astype(np.int32)], 255)
-    pm = cv2.dilate(pm, np.ones((MASK_DILATE, MASK_DILATE), np.uint8))
+    mu, mv = out_uv
+
+    def mask(p):
+        pm = np.zeros(frame.shape[:2], np.uint8)
+        cv2.fillPoly(pm, [np.clip(p, -1e5, 1e5).round().astype(np.int32)], 255)
+        return cv2.dilate(pm, np.ones((MASK_DILATE, MASK_DILATE), np.uint8))
+
+    def inside(u, v, mu, mv):
+        return -FIELD_MARGIN - mu <= u <= 1 + FIELD_MARGIN + mu and -FIELD_MARGIN - mv <= v <= 1 + FIELD_MARGIN + mv
 
     cands = []
-    for c in find_candidates(frame, TACTICAL_CFG, pm):
+    for c in find_candidates(frame, TACTICAL_CFG, mask(poly)):  # in-field: unchanged by the out band
         x1, y1, x2, y2 = c["bbox"]
         u, v = unproject(H, (x1 + x2) / 2, (y1 + y2) / 2)
-        if -FIELD_MARGIN <= u <= 1 + FIELD_MARGIN and -FIELD_MARGIN <= v <= 1 + FIELD_MARGIN:
-            cands.append(dict(c, u=float(u), v=float(v)))
+        if inside(u, v, 0, 0):
+            cands.append(dict(c, u=float(u), v=float(v), off=False))
+    if mu or mv:  # second pass on the wider mask, keeping only the candidates beyond the lines
+        outer = np.array([project(H, x, y) for x, y in [(-mu, -mv), (1 + mu, -mv), (1 + mu, 1 + mv), (-mu, 1 + mv)]])
+        for c in find_candidates(frame, TACTICAL_CFG, mask(outer)):
+            x1, y1, x2, y2 = c["bbox"]
+            u, v = unproject(H, (x1 + x2) / 2, (y1 + y2) / 2)
+            if inside(u, v, mu, mv) and not inside(u, v, 0, 0):
+                cands.append(dict(c, u=float(u), v=float(v), off=True))
     if not cands:
         return None, [], poly
     X = [extract(square_crop(frame, c["bbox"]), dict(zip(("x1", "y1", "x2", "y2"), c["bbox"]), **c),
@@ -84,8 +99,9 @@ def detect(frame, H, model, threshold, project, unproject):
     scores = model["model"].decision_function(np.array(X))
     for c, s in zip(cands, scores):
         c["score"] = float(s)
-    k = int(np.argmax(scores))
-    best = cands[k] if scores[k] > threshold else None
+    inside = [k for k, c in enumerate(cands) if not c["off"]]
+    k = max(inside, key=lambda k: scores[k]) if inside else None
+    best = cands[k] if k is not None and scores[k] > threshold else None
     return best, cands, poly
 
 
@@ -143,6 +159,9 @@ def main(args):
     with open(args.model, "rb") as f:
         model = pickle.load(f)
     matrices, _, valid = LH.load()
+    from games import GAME, GAMES
+    L, W = GAMES[GAME]["pitch"]
+    out_uv = (args.out_margin / L, args.out_margin / W)
     balls = OV.atd_ball(args.first, args.last)
     gt = load_gt(os.path.join(args.mtah, "evaluation", "gt", "BAR-ATH_possession_gt_public.csv"))
     yolo = load_yolo(os.path.join(args.mtah, "data", "ball_yolo", "yolo_vs_atd_11185_18684.csv"))
@@ -156,7 +175,7 @@ def main(args):
         os.path.join(args.out_dir, stem + ".mp4"), cv2.VideoWriter_fourcc(*"mp4v"), capture.get(cv2.CAP_PROP_FPS), (w, h))
     cand_file = open(os.path.join(args.out_dir, stem + "_candidates.csv"), "w", newline="")
     cand_csv = csv.writer(cand_file)
-    cand_csv.writerow(["frame", "x1", "y1", "x2", "y2", "u", "v", "score"])  # u, v = normalised pitch coords
+    cand_csv.writerow(["frame", "x1", "y1", "x2", "y2", "u", "v", "score", "off"])  # u, v = normalised pitch coords
 
     rows, started = [], time.time()
     for video_frame in range(args.first, args.last + 1):
@@ -166,10 +185,10 @@ def main(args):
             break
         H = matrices[video_frame]
         det, cands, poly = (None, [], np.zeros((4, 2))) if not valid[video_frame] else \
-            detect(frame, H, model, args.threshold, LH.project, LH.unproject)
+            detect(frame, H, model, args.threshold, LH.project, LH.unproject, out_uv)
         n_cands = len(cands)
         for c in cands:
-            cand_csv.writerow([video_frame, *c["bbox"], f"{c['u']:.5f}", f"{c['v']:.5f}", f"{c['score']:.3f}"])
+            cand_csv.writerow([video_frame, *c["bbox"], f"{c['u']:.5f}", f"{c['v']:.5f}", f"{c['score']:.3f}", int(c["off"])])
 
         atd_px = None
         bx, by = balls.get(video_frame, (np.nan, np.nan))
@@ -216,6 +235,8 @@ if __name__ == "__main__":
     ap.add_argument("--model", default=os.path.join(HERE, "models", "ball_svm.pkl"))
     ap.add_argument("--threshold", type=float, default=0.0, help="min SVM score to output a ball")
     ap.add_argument("--out-dir", default=None)
+    ap.add_argument("--out-margin", type=float, default=0.0,
+                    help="metres beyond the lines where candidates are also kept, flagged off (ball going out)")
     ap.add_argument("--no-video", action="store_true", help="only write the CSVs (candidates for track.py)")
     a = ap.parse_args()
     a.out_dir = a.out_dir or os.path.join(a.mtah, "data", "ball_classical")

@@ -41,7 +41,11 @@ approximation of a second-order model: each node keeps the velocity of its own b
    --attach (off by default): such gaps, any length the path links, follow the player's ATD position instead.
    Approved batch3hc output: --boot-mode off --max-gap 25 --no-carried.
 
-Video legend: green box = tracked detection, orange circle = interpolated, orange circle + white dot = carried,
+4. Ball going out (candidates from run_tactical.py --out-margin, flagged off): an off-pitch candidate can only extend
+   a track by a normal link (never starts a track, never jumped onto); status "out". A gap from in-field to out is
+   interpolated (the ball rolls across the line), out -> out is "out", out -> in-field stays "no ball" (by hand).
+
+Video legend: white box / circle = ball out (detected / between two out detections), green box = tracked detection, orange circle = interpolated, orange circle + white dot = carried,
 cyan circle = attached, magenta ring = boot zone (BOOT_R around each ATD player), thin magenta box + "boot" = path
 detection turned into a gap (strict), "before>after" = candidate penalised / rejected, thin red box = raw top
 candidate the tracker rejected, blue circle = ATD ball (Metrica automatic tracking, NOT ground truth).
@@ -99,7 +103,8 @@ def load_candidates(path):
     with open(path) as f:
         for r in csv.DictReader(f):
             by_frame[int(r["frame"])].append(dict(bbox=tuple(int(r[k]) for k in ("x1", "y1", "x2", "y2")),
-                                                  u=float(r["u"]), v=float(r["v"]), score=float(r["score"])))
+                                                  u=float(r["u"]), v=float(r["v"]), score=float(r["score"]),
+                                                  off=r.get("off", "0") == "1"))
     return by_frame
 
 
@@ -193,6 +198,7 @@ def best_path(by_frame, first, last):
     n = len(nodes)
     pos = np.array([[c["u"] * PITCH[0], c["v"] * PITCH[1]] for _, c in nodes]).reshape(n, 2)
     gain = np.array([c["score"] for _, c in nodes]) - BIAS
+    off = np.array([c.get("off", False) for _, c in nodes], bool)  # beyond the lines (run_tactical --out-margin)
     best = np.full(n, -np.inf)
     prev = np.full(n, -1)          # linked predecessor node, -1 = none
     jumped = np.zeros(n, bool)     # reached from prev by a jump (not physically reachable)
@@ -205,7 +211,7 @@ def best_path(by_frame, first, last):
         cur = frame_nodes[t]
         if len(cur):
             free_val, free_node = prefix.get(t - FREE_RESTART - 1, (0.0, -1))
-            cand_val = np.full(len(cur), free_val - NEW_TRACK)
+            cand_val = np.where(off[cur], -np.inf, free_val - NEW_TRACK)  # off-pitch never starts a track
             cand_prev = np.full(len(cur), -1)
             cand_jump = np.zeros(len(cur), bool)
             cand_v = np.full((len(cur), 2), np.nan)
@@ -223,7 +229,7 @@ def best_path(by_frame, first, last):
                     link = link - VEL_W * np.maximum(0.0, dv - VEL_TOL)
                 jump = best[pk][None, :] - NEW_TRACK - JUMP_PER_M * (d - reach)
                 is_jump = d > reach
-                val = np.where(is_jump, jump, link)
+                val = np.where(is_jump, np.where(off[cur][:, None], -np.inf, jump), link)  # nor is jumped onto
                 j = np.argmax(val, axis=1)
                 rows = np.arange(len(cur))
                 v = val[rows, j]
@@ -264,7 +270,7 @@ def build_track(path, matrices, project, first, last, players=None):
     scale = np.array(PITCH)
     for t, (c, pt, jump) in path.items():
         x1, y1, x2, y2 = c["bbox"]
-        track[t] = dict(status="det", u=c["u"], v=c["v"], px=((x1 + x2) / 2, (y1 + y2) / 2), score=c["score"], bbox=c["bbox"])
+        track[t] = dict(status="out" if c.get("off") else "det", u=c["u"], v=c["v"], px=((x1 + x2) / 2, (y1 + y2) / 2), score=c["score"], bbox=c["bbox"])
         if ATTACH and players is not None and pt is not None and not jump and t - pt > 1:
             a = path[pt][0]
             ball_a, ball_b = np.array([a["u"], a["v"]]) * scale, np.array([c["u"], c["v"]]) * scale
@@ -278,9 +284,11 @@ def build_track(path, matrices, project, first, last, players=None):
                 continue
         if pt is not None and not jump and 1 < t - pt <= MAX_GAP + 1:  # jumps and long gaps stay "no ball"
             a = path[pt][0]
+            if a.get("off") and not c.get("off"):
+                continue  # out -> back in: the ball comes back by hand, not along a path
             curve = hermite(path, frames, pt, t) if INTERP_MODE == "hermite" else None
-            status = "interp"
-            if CARRIED and players is not None and follow(players, first, pt, t, np.array([a["u"], a["v"]]) * scale,
+            status = "out" if a.get("off") and c.get("off") else "interp"  # in -> out rolls across the line
+            if status == "interp" and CARRIED and players is not None and follow(players, first, pt, t, np.array([a["u"], a["v"]]) * scale,
                                                           np.array([c["u"], c["v"]]) * scale) is not None:
                 status = "carried"
             for s in range(pt + 1, t):
@@ -416,12 +424,18 @@ def render(args, track, by_frame, ref, matrices, LH, OV, players=None):
         if tr["status"] == "det":
             x1, y1, x2, y2 = tr["bbox"]
             cv2.rectangle(frame, (x1 - 6, y1 - 6), (x2 + 6, y2 + 6), TRACKED, 2)
+        elif tr["status"] == "out":  # beyond the lines: white box (detection) or white circle (between two)
+            if "bbox" in tr:
+                x1, y1, x2, y2 = tr["bbox"]
+                cv2.rectangle(frame, (x1 - 6, y1 - 6), (x2 + 6, y2 + 6), TEXT, 2)
+            else:
+                cv2.circle(frame, (int(tr["px"][0]), int(tr["px"][1])), 10, TEXT, 2)
         elif tr["status"] in ("interp", "carried", "attached"):
             cv2.circle(frame, (int(tr["px"][0]), int(tr["px"][1])), 10, ATTACHED if tr["status"] == "attached" else INTERP, 2)
             if tr["status"] == "carried":
                 cv2.circle(frame, (int(tr["px"][0]), int(tr["px"][1])), 3, TEXT, -1)
         status = f"frame {t}  GT {r['gt'] if r else 'X'}  BALL {tr['status'].upper()}" + \
-                 (f" {tr['score']:.2f}" if tr["status"] == "det" else "") + ("  (raw pick rejected)" if raw is not None and (tr["status"] != "det" or tr["bbox"] != raw["bbox"]) else "")
+                 (f" {tr['score']:.2f}" if "score" in tr else "") + ("  (raw pick rejected)" if raw is not None and (tr["status"] != "det" or tr["bbox"] != raw["bbox"]) else "")
         cv2.rectangle(frame, (0, 1040), (900, 1080), (0, 0, 0), -1)
         cv2.putText(frame, status, (10, 1068), cv2.FONT_HERSHEY_SIMPLEX, 0.7, TEXT, 2, cv2.LINE_AA)
         writer.write(frame)

@@ -121,15 +121,17 @@ def compute(first, last, track):
     meta_path, raw_path, tag_path = P.require(["atd_meta", "atd_raw", "smart_tagging"])
     kicks = TG.kickoffs(tag_path)
     home_left = TG.home_left(d["frames"], TG.sides(kicks, raw_path.replace("_atd.txt", "_atd_original.txt"), d["teams"]))
-    d["teams_f"] = teams_per_frame(d, TG.goalkeeper_slots(meta_path), home_left)
+    d["gk_slots"], d["home_left"] = TG.goalkeeper_slots(meta_path), home_left  # also used by deadball.py
+    d["teams_f"] = teams_per_frame(d, d["gk_slots"], home_left)
     d["touches"], d["tinfo"] = T.touches(d)
     d["kickoffs"] = kickoffs(d, kicks, home_left)
     d["labels"], d["events"] = hand_over(d["touches"], len(d["frames"]), d["kickoffs"])
     return d
 
 
-def main(args):
-    d = compute(args.first, args.last, args.track)
+def main(args, compute_fn=None):
+    """Writes the CSVs and prints a summary; compute_fn: a compute() with the same output (possession_v4)."""
+    d = (compute_fn or compute)(args.first, args.last, args.track)
     frames, labels, status, ev = d["frames"], d["labels"], d["status"], d["touches"]
     at = {}
     for e in ev:

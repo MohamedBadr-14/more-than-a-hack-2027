@@ -38,6 +38,13 @@ provenance). This file is the state, the decisions and the rules that README doe
 - Earlier outputs reproduce exactly with flags:
   - approved batch3hc: `--boot-mode off --max-gap 25 --no-carried`
   - boot_attach: `--boot-mode penalty --boot-r 0.3 --max-gap 25 --attach --no-carried`
+- **Ball-out detection** (user approved, 2026-11-11; used by possession v4): `run_tactical.py --out-margin 3` keeps
+  candidates up to 3 m beyond the lines, flagged `off`. Two passes so in-field candidates stay identical to the approved
+  run (checked: 0 rows differ): in-field from the old mask, off-pitch only from a mask widened to the 3 m band.
+  `track.py`: an off candidate never starts a track and is never jumped onto, only extends one by a normal link;
+  status `out`. Gaps in→out are interpolated (ball rolls across the line, status `interp`), out→out = `out`, out→in
+  stay `none` (ball comes back by hand). Run: `../data/ball_classical/out3/` (in the window: 223 `out` frames, mostly
+  in dead balls; one possibly false at 11275). Default `--out-margin 0` = old behaviour.
 - **ATD splice**: `data/tactical/BAR-ATH_tactical_atd.txt` has our (batch3hc) ball in place of Metrica's for frames
   11185–18684 (players untouched). Original kept as `BAR-ATH_tactical_atd_original.txt`. Anything that needs Metrica's
   ball or the players reads the original.
@@ -74,8 +81,11 @@ provenance). This file is the state, the decisions and the rules that README doe
 - **Far-side detection** (approved earlier): far-side ball detected less (6–7 px vs 9 px). Fix 1: looser white threshold
   (now V≥170, S≤60) and smaller min area (area_far now (4,120)) for the far side only. Changes the candidate pipeline:
   show the user exact values first.
-- Run the pipeline on the full match (only 11185–18684 has candidates now; `run_tactical.py` ≈5 min per 7500 frames).
-- Output during dead ball: with the 2 s gap limit 100% of D frames get a ball (ball-alive 98.0%). Don't use the rejected "out of play" rule.
+- Run the pipeline on the full match with `--out-margin 3` (only 11185–18684 has candidates now; `run_tactical.py`
+  ≈6–8 min per 7500 frames with the out band).
+- Output during dead ball: with the 2 s gap limit 100% of D frames get a ball (ball-alive 98.0%). Don't use the
+  rejected inference "out of play" rule (ball last seen near a line then missing → stop); detecting the ball over the
+  line (above) is different and approved.
 
 ## Tips
 - Run scripts from this folder with `-u` (unbuffered). Don't pipe long runs through grep.

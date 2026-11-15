@@ -66,11 +66,13 @@ def angle(u, v):
 
 
 def pieces(ball_m, status):
-    """Piece id per frame: a new piece after every missing ball, impossible step or switch to / from ATD."""
+    """Piece id per frame: a new piece after every missing ball, impossible step or switch to / from ATD or to / from
+    a ball out of play (status "out", track.py)."""
     step = np.hypot(*(ball_m - shift(ball_m, -1)).T) * P.FPS
     atd = np.array([s == "atd" for s in status])
+    out = np.array([s == "out" for s in status])
     with np.errstate(invalid="ignore"):
-        cut = ~(step <= MAX_SPEED) | (atd != np.roll(atd, 1))
+        cut = ~(step <= MAX_SPEED) | (atd != np.roll(atd, 1)) | (out != np.roll(out, 1))
     cut[0] = True
     return np.cumsum(cut), cut
 
@@ -213,6 +215,7 @@ def touches(d):
     for a, b, team in holds(d_team, who):
         out.append(dict(a=a, b=b, t=a, team=team, kind="hold", far=False, bounce=False, why=f"{b - a + 1} frames",
                         d_h=np.nanmin(d_team[a:b + 1, P.HOME]), d_a=np.nanmin(d_team[a:b + 1, P.AWAY])))
+    out = [e for e in out if d["status"][e["t"]] != "out"]  # ball out of play: nobody plays it (deadball.py uses it)
     out.sort(key=lambda e: e["t"])
     return out, dict(bc, d_team=d_team, speed=np.hypot(*fit(ball_m, piece, -2, 2).T), cut=cut)
 
