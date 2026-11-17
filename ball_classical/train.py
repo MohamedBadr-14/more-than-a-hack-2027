@@ -32,6 +32,8 @@ PARAM_GRID = [
 
 def load(dataset):
     rows = [r for r in csv.DictReader(open(os.path.join(dataset, "labels.csv"))) if r["label"] in ("pos", "neg")]
+    for r in rows:
+        r["path"] = r["path"].replace("\\", "/")  # CSVs were written on Windows; "/" works on every OS
     crops = [cv2.imread(r["path"] if os.path.isabs(r["path"]) else os.path.join(HERE, r["path"])) for r in rows]
     keep = [i for i, c in enumerate(crops) if c is not None and c.size]
     rows, crops = [rows[i] for i in keep], [crops[i] for i in keep]
