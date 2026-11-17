@@ -35,7 +35,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 MTAH = os.path.dirname(HERE)  # this folder sits at the root of the more-than-a-hack-2027 repo
 
 # Tactical camera: ball is ~4 px (far side) to ~10 px (near side) across, so no opening and smaller
-# areas. Tuned on frames 25000-40000 (outside the public window) against the ATD ball.
+# areas. Set on the provided match outside the public window, against the ATD ball.
 TACTICAL_CFG = dict(CFG, hud_boxes=[], open_kernel=1, close_kernel=3,
                     white_lower=(0, 0, 170), white_upper=(179, 60, 255),
                     area_far=(4, 120), area_near=(15, 400))

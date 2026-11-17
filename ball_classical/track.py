@@ -71,7 +71,7 @@ FREE_RESTART = 125     # frames (5 s) without a ball after which a track may res
 BIAS = 0.0             # subtracted from every SVM score; 0.4 / 0.2 / 0.1 dropped too many real balls
                        # (they often score 0.0-0.3 on real footage)
 SKIP_COST = 0.0        # per skipped frame inside a track; 0.1 (capped at NEW_TRACK for long gaps) made skipping a
-                       # sparsely seen ball cheaper than following it (frames 11855-11995 all dropped)
+                       # sparsely seen ball cheaper than following it (long stretches of the ball dropped)
 CONTINUITY = 0.1       # bonus for linking consecutive frames
 LAMBDA = 0.05          # per metre moved
 NEW_TRACK = 4.0        # base cost of a jump / restart; must exceed the cost of the longest allowed gap

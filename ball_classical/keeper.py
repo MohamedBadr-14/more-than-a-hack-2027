@@ -1,6 +1,6 @@
 """Keeper holds: a goalkeeper has the ball and our detector has lost it (ball in his hands, against his body).
 
-During such a hold the tracker jumps to boots far away (e.g. 26690-26970). track.py --keeper-hold uses the holds
+During such a hold the tracker jumps to boots far away. track.py --keeper-hold uses the holds
 found here to keep the ball near the keeper; this file only finds them.
 
 Rules (all from our ball track, our candidates and ATD player positions; ATD ball only as a release safety net):

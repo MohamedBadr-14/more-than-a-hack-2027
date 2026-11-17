@@ -11,8 +11,7 @@ spectrogram), and a crowd is many such lines starting at different times. So:
 4. Whistle: >= MIN_LINES flat lines whose onsets are within ONSET s of each other; start / end = earliest onset /
    latest offset; freqs = the lines' mean frequencies. Whistles closer than MERGE s are one whistle.
 5. Referee, not fans: >= MIN_LINES of its tones within TONE_REL of the referee's tones REF_TONES. REF_TONES were
-   measured with steps 1-4 at the smart tagging kick-off whistles outside the public window (2nd half kick-off
-   113707-113729: 3842-3870 / 4270-4278 Hz; after-goal kick-off 163072: 3781 / 4728 Hz).
+   measured with steps 1-4 at kick-off whistles of the provided match, outside the public window.
 
 Pair detector (pair_whistles, used by possession_v5 through referee_whistles): the referee's whistle wobbles, fades
 and comes in short blasts, and its pitch moves with how hard it is blown (lower tone ~3.69-3.87 kHz), so tone
