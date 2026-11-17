@@ -20,7 +20,8 @@ off by ~0.5 m too often to gate on). Interpolated and carried balls are treated 
      CONTEST_M of each other = contested, decided later by who comes out with the ball)
    - nobody within R: the same with the wider R_FAR, marked far (player position off by a metre or two)
    - nobody within R_FAR either: unknown, ignored (a bounce, a ball in the air, a missing player)
-4. Hold: one player (followed by position, slot ids swap) within R for >= HOLD frames.
+4. Hold: one player (followed by position, slot ids swap) within R for >= HOLD frames. Also each keeper hold of
+   track.py --keeper-hold ("held" frames): a hold by the goalkeeper's team from the catch (keeper_holds()).
 5. Bounce flag (review only, possession still counts these touches): a ball in the air is placed on the pitch too far along the
    camera's line of sight (the pitch direction of "up" in the image at the ball), so a bounce changes the
    velocity along that line. Ball events whose velocity change is within BOUNCE_COS of it are flagged.
@@ -43,6 +44,7 @@ HOLD = 25        # frames (1 s)
 SAME_PLAYER = 0.8  # m per frame; the nearest in-reach player moving more than this = another player
 MAX_SPEED = 35.0   # m/s, a faster step between two frames is not the ball rolling (air / tracker jump)
 SMOOTH = 2       # frames each side for the position smoothing
+KEEPER_BRIDGE = P.FPS  # frames of detections inside a keeper hold ("held" runs this close = one hold)
 BOUNCE_COS = 0.98  # |cos| between the velocity change and the line of sight at or above this = bounce flag
 NONE, BOTH = -1, 2
 TESTS = ("turn", "slow down", "kick from slow")
@@ -173,6 +175,29 @@ def holds(d_team, who):
     return out
 
 
+def keeper_holds(d, d_team):
+    """Hold events from track.py --keeper-hold: each run of "held" frames (holes of detections <= KEEPER_BRIDGE
+    bridged) is one hold by the goalkeeper's team, from the catch (the detection the run starts after).
+    Goalkeeper = the gk slot nearest the ball at the catch (d['gk_slots'], teams per frame d['teams_f'])."""
+    status = np.asarray(d["status"])
+    held = status == "held"
+    if not held.any() or "gk_slots" not in d:
+        return []
+    ball_m, players_m = d["ball_n"] * P.PITCH, d["players_n"] * P.PITCH
+    out = []
+    for a, b in spans(held, KEEPER_BRIDGE):
+        if a > 0 and status[a - 1] == "det":
+            a -= 1  # the catch
+        dist = [np.hypot(*(players_m[a, s] - ball_m[a])) for s in d["gk_slots"]]
+        if not np.isfinite(dist).any():
+            continue
+        s = d["gk_slots"][int(np.nanargmin(dist))]
+        team = int(d["teams_f"][a, s])
+        out.append(dict(a=a, b=b, t=a, team=team, kind="hold", far=False, bounce=False, why=f"keeper hold, {b - a + 1} frames",
+                        d_h=np.nanmin(d_team[a:b + 1, P.HOME], initial=np.inf), d_a=np.nanmin(d_team[a:b + 1, P.AWAY], initial=np.inf)))
+    return out
+
+
 def line_of_sight_cos(d, events):
     """|cos| between each ball event's velocity change and the camera's line of sight at the ball (NaN if
     unknown), from that frame's homography: the pitch shift of the ball's pixel moved up the image."""
@@ -215,6 +240,8 @@ def touches(d):
     for a, b, team in holds(d_team, who):
         out.append(dict(a=a, b=b, t=a, team=team, kind="hold", far=False, bounce=False, why=f"{b - a + 1} frames",
                         d_h=np.nanmin(d_team[a:b + 1, P.HOME]), d_a=np.nanmin(d_team[a:b + 1, P.AWAY])))
+    kh = keeper_holds(d, d_team)  # track.py --keeper-hold: ball in the keeper's hands, too far from him for R
+    out = [e for e in out if not any(h["a"] < e["t"] <= h["b"] for h in kh)] + kh  # nobody else plays it meanwhile
     out = [e for e in out if d["status"][e["t"]] != "out"]  # ball out of play: nobody plays it (deadball.py uses it)
     out.sort(key=lambda e: e["t"])
     return out, dict(bc, d_team=d_team, speed=np.hypot(*fit(ball_m, piece, -2, 2).T), cut=cut)

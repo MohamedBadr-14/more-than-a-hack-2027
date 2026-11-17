@@ -490,8 +490,9 @@ def cache_path(args):
     here (any code change -> a new key, never a stale result)."""
     import glob
     import hashlib
-    h = hashlib.sha1(f"{args.first} {args.last} {args.layout} {os.path.abspath(args.track)} "
-                     f"{os.path.getmtime(args.track)}".encode())
+    dead = f" dead {os.path.abspath(args.dead_track)}" if getattr(args, "dead_track", None) else ""
+    h = hashlib.sha1((f"{args.first} {args.last} {args.layout} {os.path.abspath(args.track)} "
+                      f"{os.path.getmtime(args.track)}" + dead).encode())
     import inspect
     for p in sorted(glob.glob(os.path.join(os.path.dirname(os.path.abspath(__file__)), "*.py"))):
         if os.path.basename(p) == "debug_view.py":  # drawing code: only render_compute() counts
@@ -520,7 +521,8 @@ def render(args):
 
 def render_compute(args):
     if args.layout in ("v3", "v4", "v5"):
-        d = {"v3": V3, "v4": V4, "v5": V5}[args.layout].compute(args.first, args.last, args.track)
+        extra = {"dead_track": args.dead_track} if args.layout == "v5" and getattr(args, "dead_track", None) else {}
+        d = {"v3": V3, "v4": V4, "v5": V5}[args.layout].compute(args.first, args.last, args.track, **extra)
         d["v3"] = True
         if args.layout in ("v4", "v5"):
             d["v4"] = True
@@ -748,6 +750,8 @@ if __name__ == "__main__":
     ap.add_argument("--atd", nargs="?", const=os.path.join(P.MTAH, "data", "tactical", "BAR-ATH_tactical_atd_old.txt"),
                     help="view: an ATD .txt (default: the original ATD kept as ..._atd_old.txt); draws its ball "
                          "(magenta cross) over the video, o toggles")
+    ap.add_argument("--dead-track", default=None,
+                    help="v5 (keeper catches): dead balls / kick-offs / half edges from this track, as possession_v5.py")
     ap.add_argument("--layout", choices=["full", "touch", "v3", "v4", "v5"], default="full",
                     help="touch = only what decides a touch (ball, reach, tests, touch row); v3 = touch + possession v3; "
                          "v4 = v3 + dead ball; v5 = v4 + half edges / kick-offs")

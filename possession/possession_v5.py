@@ -117,11 +117,22 @@ def final_whistle(d, whistles):
     return None
 
 
-def compute(first, last, track):
-    """possession_v4.compute()'s dict, with v5's whistles, sides, kick-offs and half edges (d['edges'])."""
+def compute(first, last, track, dead_track=None):
+    """possession_v4.compute()'s dict, with v5's whistles, sides, kick-offs and half edges (d['edges']).
+    dead_track (--dead-track, keeper catches): dead balls, whistles, kick-offs and half edges are those of `dead_track`
+    (v5f on the track without --keeper-hold, exactly); only the touches (incl. keeper holds) come from `track`."""
     (h, h_first, h_last), = [blk for blk in half_video_blocks(P.GAME) if blk[1] <= first <= blk[2]]
     if last > h_last:
         raise SystemExit(f"range {first}-{last} crosses the end of half {h} ({h_last})")
+    if dead_track:
+        dd = compute(first, last, dead_track)
+        d = P.compute(first, last, track)
+        d["gk_slots"], d["home_left"], d["teams_f"] = dd["gk_slots"], dd["home_left"], dd["teams_f"]
+        d["touches"], d["tinfo"] = T.touches(d)
+        for k in ("whistles", "kickoffs", "dfeat", "edges", "dead", "k0", "end", "atd_ball"):
+            if k in dd:
+                d[k] = dd[k]
+        return label(d)
     d = P.compute(first, last, track)
     meta_path, raw_path, tag_path = P.require(["atd_meta", "atd_raw", "smart_tagging"])
     orig = raw_path.replace("_atd.txt", "_atd_original.txt")
@@ -163,7 +174,13 @@ def compute(first, last, track):
                 edges["end"] = (None, None, "no final whistle, no open wait")
     d["edges"] = edges
     d["dead"] = [db for db in dead if db["r"] > k0 and db["s"] < end]
+    d["k0"], d["end"] = k0, end
+    return label(d)
 
+
+def label(d):
+    """Labels from d's touches, dead balls, kick-offs and half edges (k0 = first kick-off, end = half-end D start)."""
+    n, k0, end = len(d["frames"]), d["k0"], d["end"]
     inside = np.zeros(n + 1, bool)
     inside[:k0] = True
     inside[end:] = True
@@ -187,7 +204,7 @@ def main(args):
     d = {}
 
     def keep(*a):
-        d.update(compute(*a))
+        d.update(compute(*a, dead_track=args.dead_track))
         return d
     V3.main(args, keep, ungraded="D")
     f, ed = d["frames"], d["edges"]
@@ -213,5 +230,8 @@ if __name__ == "__main__":
     ap.add_argument("--track", default=os.path.join(P.MTAH, "data", "ball_classical", "out3", "tracked_11185_18684.csv"))
     ap.add_argument("--out-dir", default=os.path.join(P.MTAH, "data", "possession"))
     ap.add_argument("--no-dead-atd", action="store_true", help="v5: our ball inside dead balls too")
+    ap.add_argument("--dead-track", default=None,
+                    help="keeper catches: dead balls / whistles / kick-offs / half edges from this track (the one without "
+                         "--keeper-hold, i.e. exactly v5f's), touches from --track")
     ap.add_argument("--tag", default="_v5f", help="suffix for the output names (keeps earlier outputs)")
     main(ap.parse_args())

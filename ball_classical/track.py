@@ -92,9 +92,11 @@ ATTACH = False         # --attach: such gaps follow the player's ATD position in
 ATTACH_R = 1.0         # m; detections on both sides of the gap must be this close to the followed player
 FOLLOW_STEP = 0.5      # m/frame (12.5 m/s) the followed player may move; two players within it = ambiguous
 FOLLOW_MISS = 5        # frames the followed player may be missing from the ATD
+KEEPER_HOLD = False    # --keeper-hold: second pass gated to the keeper during keeper holds (keeper.py), status "held"
 
 TRACKED, INTERP, REJECTED, ATD_C, PITCH_C, TEXT = (0, 255, 0), (0, 165, 255), (0, 0, 255), (255, 128, 0), (0, 255, 255), (255, 255, 255)
 ATTACHED = (255, 255, 0)
+HELD = (203, 192, 255)  # pink: ball filled in during a keeper hold
 BOOT_C, BOOTED = (255, 0, 255), (255, 0, 255)  # boot zone circles; penalised candidates
 
 
@@ -143,12 +145,14 @@ def penalise_boots(by_frame, players, first, last):
     return n
 
 
-def gap_boots(path, players, first):
+def gap_boots(path, players, first, skip=frozenset()):
     """Strict mode: remove path detections within BOOT_R of a player, relinking the path across them.
-    Returns the removed frames."""
+    Frames in `skip` (keeper holds: the ball is on the keeper by definition) are left alone. Returns the removed frames."""
     removed = []
     for t in sorted(path):
         c, pt, jump = path[t]
+        if t in skip:
+            continue
         if nearest_player(players, t, first, np.array([c["u"], c["v"]]) * PITCH)[0] < BOOT_R:
             c["boot_gap"] = True
             removed.append(t)
@@ -259,11 +263,13 @@ def best_path(by_frame, first, last):
     return path
 
 
-def build_track(path, matrices, project, first, last, players=None):
-    """Per-frame dict: status det/interp/carried/attached/none, u, v (normalised), px (x, y), score, bbox.
+def build_track(path, matrices, project, first, last, players=None, held=frozenset()):
+    """Per-frame dict: status det/interp/carried/attached/held/none, u, v (normalised), px (x, y), score, bbox.
 
     attached: a gap (any length the path links, not a jump) whose detections on both sides sit at the same
     position-followed player; the ball keeps its offset from him, blended linearly from one end to the other.
+    held: a gap starting inside a keeper hold (`held`, --keeper-hold); filled like any gap, any length the path links
+    (not capped at MAX_GAP).
     """
     track = {t: dict(status="none") for t in range(first, last + 1)}
     frames = sorted(path)
@@ -282,14 +288,17 @@ def build_track(path, matrices, project, first, last, players=None):
                     u, v = (carrier[s - pt] + off_a + w * (off_b - off_a)) / scale
                     track[s] = dict(status="attached", u=float(u), v=float(v), px=tuple(float(z) for z in project(matrices[s], u, v)))
                 continue
-        if pt is not None and not jump and 1 < t - pt <= MAX_GAP + 1:  # jumps and long gaps stay "no ball"
+        in_hold = pt is not None and t - pt > 1 and pt + 1 in held  # gap starting inside a keeper hold
+        if pt is not None and not jump and (1 < t - pt <= MAX_GAP + 1 or in_hold):  # jumps and long gaps stay "no ball"
             a = path[pt][0]
             if a.get("off") and not c.get("off"):
                 continue  # out -> back in: the ball comes back by hand, not along a path
             curve = hermite(path, frames, pt, t) if INTERP_MODE == "hermite" else None
             status = "out" if a.get("off") and c.get("off") else "interp"  # in -> out rolls across the line
-            if status == "interp" and CARRIED and players is not None and follow(players, first, pt, t, np.array([a["u"], a["v"]]) * scale,
-                                                          np.array([c["u"], c["v"]]) * scale) is not None:
+            if status == "interp" and in_hold:
+                status = "held"
+            elif status == "interp" and CARRIED and players is not None and follow(players, first, pt, t, np.array([a["u"], a["v"]]) * scale,
+                                                            np.array([c["u"], c["v"]]) * scale) is not None:
                 status = "carried"
             for s in range(pt + 1, t):
                 if curve is not None:
@@ -430,8 +439,9 @@ def render(args, track, by_frame, ref, matrices, LH, OV, players=None):
                 cv2.rectangle(frame, (x1 - 6, y1 - 6), (x2 + 6, y2 + 6), TEXT, 2)
             else:
                 cv2.circle(frame, (int(tr["px"][0]), int(tr["px"][1])), 10, TEXT, 2)
-        elif tr["status"] in ("interp", "carried", "attached"):
-            cv2.circle(frame, (int(tr["px"][0]), int(tr["px"][1])), 10, ATTACHED if tr["status"] == "attached" else INTERP, 2)
+        elif tr["status"] in ("interp", "carried", "attached", "held"):
+            cv2.circle(frame, (int(tr["px"][0]), int(tr["px"][1])), 10,
+                       {"attached": ATTACHED, "held": HELD}.get(tr["status"], INTERP), 2)
             if tr["status"] == "carried":
                 cv2.circle(frame, (int(tr["px"][0]), int(tr["px"][1])), 3, TEXT, -1)
         status = f"frame {t}  GT {r['gt'] if r else 'X'}  BALL {tr['status'].upper()}" + \
@@ -448,6 +458,43 @@ def render(args, track, by_frame, ref, matrices, LH, OV, players=None):
     print("wrote", path)
 
 
+def keeper_pass(args, by_frame, track, players, matrices, project, require):
+    """--keeper-hold: find keeper holds (keeper.py) on the first-pass track, drop every candidate farther than
+    keeper.GATE_R from the keeper on hold frames, choose the path again (boot rule off on hold frames) and fill gaps
+    inside a hold as "held". Writes keeper_holds_<first>_<last><tag>.csv. Returns the new track."""
+    import keeper as K
+    first, last = args.first, args.last
+    meta, raw = require(["atd_meta", "atd_raw"])
+    _, atd_ball = K.load_atd(raw.replace("_atd.txt", "_atd_original.txt"), first, last)
+    status = [track[t]["status"] for t in range(first, last + 1)]
+    ball = np.array([[track[t]["u"] * PITCH[0], track[t]["v"] * PITCH[1]] if "u" in track[t] else [np.nan, np.nan]
+                     for t in range(first, last + 1)])
+    dead = K.read_dead(args.dead_csv, first, last) if args.dead_csv else None  # v5f D: the catch logic does nothing there
+    holds = K.find_holds(K.Scene(first, status, ball, by_frame, players, atd_ball, K.goalkeeper_slots(meta), dead))
+    held, gated = set(), 0
+    for cs in by_frame.values():
+        for c in cs:
+            c.pop("boot_gap", None)  # first-pass marks
+    for h in holds:
+        for k, t in enumerate(range(first + h["a"], first + h["b"] + 1)):
+            held.add(t)
+            for c in by_frame.get(t, []):
+                if np.linalg.norm(np.array([c["u"], c["v"]]) * PITCH - h["keeper"][k]) > K.GATE_R:
+                    c["score"], gated = -np.inf, gated + 1  # -inf < MIN_SCORE: ignored by best_path
+    print(f"keeper holds: {len(holds)} ({len(held)} frames), {gated} candidates outside the keeper gate dropped")
+    path = best_path(by_frame, first, last)
+    if BOOT_MODE == "strict":
+        print(f"keeper pass, boot strict: {len(gap_boots(path, players, first, held))} path detections turned into gaps")
+    new = build_track(path, matrices, project, first, last, players, held)
+    print(f"keeper pass: {sum(new[t]['status'] == 'held' for t in new)} frames held")
+    with open(os.path.join(args.out_dir, f"keeper_holds_{first}_{last}{args.tag}.csv"), "w", newline="") as f:
+        wr = csv.writer(f)
+        wr.writerow(["first", "last", "release", "gk_slot", "merged"])
+        for h in holds:
+            wr.writerow([first + h["a"], first + h["b"], h["why"], h["slot"], h.get("merged", 0)])
+    return new
+
+
 def main(args):
     sys.path[:0] = [args.mtah, os.path.join(args.mtah, "starter"), os.path.join(args.mtah, "ball_yolo")]
     import load_homography as LH
@@ -460,7 +507,7 @@ def main(args):
     matrices, _, _ = LH.load()
     from games import require
     players = None
-    if BOOT_MODE != "off" or ATTACH or CARRIED:
+    if BOOT_MODE != "off" or ATTACH or CARRIED or KEEPER_HOLD:
         # Metrica's original ATD: the live file carries our own ball in the public window (players identical)
         players = load_players(require(["atd_raw"])[0].replace("_atd.txt", "_atd_original.txt"), args.first, args.last)
     if BOOT_MODE in ("penalty", "reject"):
@@ -470,6 +517,8 @@ def main(args):
     if BOOT_MODE == "strict":
         print(f"boot strict: {len(gap_boots(path, players, args.first))} path detections turned into gaps")
     track = build_track(path, matrices, LH.project, args.first, args.last, players)
+    if KEEPER_HOLD:
+        track = keeper_pass(args, by_frame, track, players, matrices, LH.project, require)
 
     with open(os.path.join(args.out_dir, f"tracked_{args.first}_{args.last}{args.tag}.csv"), "w", newline="") as f:
         wr = csv.writer(f)
@@ -501,8 +550,12 @@ if __name__ == "__main__":
     ap.add_argument("--boot-r", type=float, default=BOOT_R, help="boot zone radius around a player, m")
     ap.add_argument("--no-carried", action="store_true", help="don't flag gaps carried by one player")
     ap.add_argument("--attach", action="store_true", help="carried gaps follow the player's ATD position")
+    ap.add_argument("--keeper-hold", action="store_true",
+                    help="second pass: during keeper holds (keeper.py) only candidates near the keeper, status held")
+    ap.add_argument("--dead-csv", default=None,
+                    help="--keeper-hold: possession CSV (v5f on the track without --keeper-hold); no catch inside its D")
     a = ap.parse_args()
     INTERP_MODE, VEL_W, BOOT_MODE, BOOT_PEN, BOOT_R = a.interp, a.vel_w, a.boot_mode, a.boot_pen, a.boot_r
-    MAX_GAP, ATTACH, CARRIED = a.max_gap, a.attach, not a.no_carried
+    MAX_GAP, ATTACH, CARRIED, KEEPER_HOLD = a.max_gap, a.attach, not a.no_carried, a.keeper_hold
     a.out_dir = a.out_dir or os.path.join(a.mtah, "data", "ball_classical")
     main(a)

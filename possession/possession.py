@@ -47,7 +47,8 @@ HOME, AWAY = 0, 1
 LABEL = "HA"
 
 TEAM_C = {HOME: (160, 60, 20), AWAY: (40, 40, 220)}  # BGR: Barca blue, Athletic red
-BALL_C = {"det": (0, 255, 0), "interp": (0, 165, 255), "carried": (0, 215, 255), "attached": (255, 255, 0), "atd": (255, 0, 255), "out": (255, 255, 255)}
+BALL_C = {"det": (0, 255, 0), "interp": (0, 165, 255), "carried": (0, 215, 255), "attached": (255, 255, 0), "atd": (255, 0, 255), "out": (255, 255, 255),
+          "held": (203, 192, 255)}  # held: keeper hold (track.py --keeper-hold)
 TEXT, CONTESTED = (255, 255, 255), (0, 255, 255)
 
 
