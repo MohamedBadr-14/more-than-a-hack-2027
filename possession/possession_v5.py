@@ -18,7 +18,11 @@ Runs on any range inside one half (a whole half or a segment of it).
 - Dead ball (DEAD_ATD, v5e): the dead balls are found as in v5c (raw ATD ball kick ends a wait); then each restart
   moves later to the ATD kick or the players clearly playing again (deadball.later_restarts); its team = the first
   touch / hold after it (v5f, deadball.first_touch_team); the players' restart is ignored when ATD sees the ball within
-  deadball.ATD_GAP of the players' run start (v5i: ball still being placed, wait for its kick)
+  deadball.ATD_GAP of the players' run start (v5i: ball still being placed, wait for its kick). v5k: only confirmed
+  outs count (deadball.confirmed_outs: depth on measured frames, ATD veto for the same ball / a raised long ball), and a
+  confirmed out going out is a dead ball by itself (deadball.out_dead_balls).
+- Kick-offs (v5j): tag kick-offs need the formation; a kick-off ends any dead ball over it; an after-goal kick-off with
+  no dead ball of >= deadball.WAIT before it gets D from the most recent dead ball (kickoff_dead).
   (deadball.atd_fast / atd_kicker); the dead ball's start and open play keep our ball.
 - Submission: frames outside both halves (never scored) are D.
 
@@ -243,5 +247,5 @@ if __name__ == "__main__":
     ap.add_argument("--track", default=os.path.join(P.MTAH, "data", "ball_classical", "out3", "tracked_11185_18684.csv"))
     ap.add_argument("--out-dir", default=os.path.join(P.MTAH, "data", "possession"))
     ap.add_argument("--no-dead-atd", action="store_true", help="v5: our ball inside dead balls too")
-    ap.add_argument("--tag", default="_v5j", help="suffix for the output names (keeps earlier outputs)")
+    ap.add_argument("--tag", default="_v5k", help="suffix for the output names (keeps earlier outputs)")
     main(ap.parse_args())

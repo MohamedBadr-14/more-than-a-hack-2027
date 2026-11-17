@@ -51,6 +51,11 @@ ATD_GAP = P.FPS // 2  # frames, atd_fast(): longest gap between two ATD ball det
 PLAY_SPEED = 2.0  # m/s, ATD mode: median player speed (1 s mean) at or above this = players clearly playing again
 PLAY_HOLD = 2 * P.FPS  # frames the players must keep that speed
 FIRST_TOUCH = 5 * P.FPS  # frames after an ATD-mode restart searched for the first team touch (its team restarts)
+OUT_DEPTH = 0.5  # m, ATD mode (v5k): a confirmed out goes at least this far past a line on measured frames
+ATD_IN = 1.0     # m, the ATD ball at least this far inside the lines (all its frames over the out) can veto the out
+SAME_BALL = 5.0  # m, median distance ATD ball - our ball: ATD is on the same ball (it saw the ball stay in)
+LONG_BALL = 15.0  # m/s, our ball entering the out this fast can be a raised ball the homography draws past the line
+OUT_GOING = 0.5  # m, a ball going out gets at least this much deeper after its first measured frame past the line
 
 
 def mean_1s(x, n=P.FPS):
@@ -126,6 +131,50 @@ def atd_fast(ball_m):
     return out
 
 
+def to_line(xy):
+    """m from the nearest line, negative past it (NaN stays NaN)."""
+    with np.errstate(invalid="ignore"):
+        return np.minimum.reduce([xy[..., 0], P.PITCH[0] - xy[..., 0], xy[..., 1], P.PITCH[1] - xy[..., 1]])
+
+
+def entry_speed(ball, a):
+    """m/s of our ball over its finite frames in the 0.5 s up to index a, NaN if unknown."""
+    idx = [i for i in range(max(a - P.FPS // 2, 0), a + 1) if np.isfinite(ball[i]).all()]
+    if len(idx) < 2:
+        return np.nan
+    return np.hypot(*(ball[idx[-1]] - ball[idx[0]])) / (idx[-1] - idx[0]) * P.FPS
+
+
+def confirmed_outs(d, ball, over_line):
+    """ATD mode (v5k): (mask, runs) of the over-line runs that are outs: our ball >= OUT_DEPTH past the line on measured
+    (not interpolated / carried) frames, and not vetoed by the ATD ball: ATD >= ATD_IN inside on every frame it sees
+    the ball while ATD is on our ball (median <= SAME_BALL) or our ball came in fast (>= LONG_BALL: a raised ball)."""
+    atd = d["atd_ball"] * P.PITCH
+    measured = ~np.isin(np.asarray(d["status"]), ["interp", "carried"])
+    out, runs = np.zeros_like(over_line), []
+    for a, b in T.spans(over_line, BRIDGE):
+        m = measured[a:b + 1]
+        if not m.any() or -np.nanmin(to_line(ball[a:b + 1][m]), initial=np.inf) < OUT_DEPTH:
+            continue
+        seen = np.isfinite(atd[a:b + 1]).all(1)
+        if seen.any() and (to_line(atd[a:b + 1][seen]) >= ATD_IN).all():
+            gap = np.nanmedian(np.hypot(*(ball[a:b + 1][seen] - atd[a:b + 1][seen]).T))
+            if gap <= SAME_BALL or entry_speed(ball, a) >= LONG_BALL:
+                continue
+        out[a:b + 1] = over_line[a:b + 1]
+        runs.append((a, b))
+    return out, runs
+
+
+def going_out(d, ball, a, b):
+    """True when, on measured frames, our ball gets >= OUT_GOING deeper after its first one past the line (a ball thrown
+    in starts deepest; interpolated frames are the tracker's path, not the ball's)."""
+    m = ~np.isin(np.asarray(d["status"][a:b + 1]), ["interp", "carried"])
+    dist = to_line(ball[a:b + 1])[m]
+    dist = dist[np.isfinite(dist)]
+    return len(dist) > 0 and dist.min() <= dist[0] - OUT_GOING
+
+
 def features(d):
     """Per-frame arrays: pspeed, slow, bspeed, still, crowd (busiest end strip count), crowded, feet, whistled, kick, fast,
     over_line. With d['atd_ball'] (possession_v5 DEAD_ATD): fast = atd_fast (a wait ends only on the ATD ball's kick)."""
@@ -144,6 +193,9 @@ def features(d):
         to_line = np.minimum.reduce([ball[:, 0], P.PITCH[0] - ball[:, 0], ball[:, 1], P.PITCH[1] - ball[:, 1]])
         seen = np.asarray(d["status"]) != "none"
         over_line = (to_line < 0) & seen
+        out_runs = []
+        if "atd_ball" in d:  # v5k: only confirmed outs count
+            over_line, out_runs = confirmed_outs(d, ball, over_line)
         ob = outed(over_line, slow, kick)
         held = wh | ob  # set-piece pauses: only a real kick ends them
         measured = ~np.isin(np.asarray(d["status"]), ["interp", "carried"])  # invented speeds never end a wait
@@ -152,6 +204,7 @@ def features(d):
                    feet=feet, whistled=wh, outed=ob, kick=kick, fast=fast, over_line=over_line)
         if "atd_ball" in d:  # a wait ends only on the ATD ball's kick or the players clearly playing again
             out["fast"] = atd_fast(d["atd_ball"] * P.PITCH)
+            out["out_runs"] = out_runs
             out["play"] = np.zeros(len(slow), bool)
             seen = np.isfinite(d["atd_ball"]).all(1)
             for a, b in T.spans(pspeed >= PLAY_SPEED, 0):
@@ -276,7 +329,38 @@ def dead_balls(d, kickoffs, gk_slots, home_left):
             continue
         out.append(dict(s=s, r=r, a=a, b=b, team=team, src=src, why=why, keeper=keeper, to_mate=to_mate))
         floor = r
-    return later_restarts(d, ft, out) if "play" in ft else out
+    return out_dead_balls(d, ft, later_restarts(d, ft, out)) if "play" in ft else out
+
+
+def out_dead_balls(d, ft, dead):
+    """ATD mode (v5k): a confirmed out going out is a dead ball by itself (quick throw-ins / goal kicks: players never
+    slow down): from its first frame to the first ATD kick / players playing at least WAIT after it (no set piece is
+    taken faster) and after the ball is back; team as later_restarts. An out overlapping a dead ball found above
+    only moves that one's start earlier (same stoppage, its restart kept)."""
+    ball = d["ball_n"] * P.PITCH
+    stop, n, extra = np.flatnonzero(ft["fast"] | ft["play"]), len(d["frames"]), []
+    for a, b in ft["out_runs"]:
+        if any(x["s"] <= a < x["r"] for x in dead) or not going_out(d, ball, a, b):
+            continue
+        k = np.searchsorted(stop, max(b + 1, a + WAIT))
+        r = int(stop[k]) if k < len(stop) else n - 1
+        team, why = first_touch_team(d, r)
+        if team is None:
+            team, why = (atd_kicker(d, r), "atd kick") if ft["fast"][r] else restart_team(d, r)
+        if team is None:
+            continue
+        src = ("atd kick" if ft["fast"][r] else "players play") + (", " + why if why else "")
+        extra.append(dict(s=a, r=r, a=a, b=r - 1, team=team, src=src, why="confirmed out", keeper=False, to_mate=None))
+    out = []
+    for x in sorted(dead + extra, key=lambda x: x["s"]):
+        if out and x["s"] < out[-1]["r"]:  # same stoppage
+            y = out[-1]
+            keep = x if y["why"] == "confirmed out" and x["why"] != "confirmed out" else y
+            r = max(x["r"], y["r"]) if x["why"] == y["why"] == "confirmed out" else keep["r"]
+            out[-1] = dict(keep, s=y["s"], why=y["why"], r=r, b=r - 1) if r != keep["r"] else dict(keep, s=y["s"], why=y["why"])
+            continue
+        out.append(x)
+    return out
 
 
 def later_restarts(d, ft, dead):
