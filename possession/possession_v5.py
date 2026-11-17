@@ -17,7 +17,8 @@ Runs on any range inside one half (a whole half or a segment of it).
   No such whistle: a wait still open at the end of the half -> D from its dead-ball start (deadball.walk_back).
 - Dead ball (DEAD_ATD, v5e): the dead balls are found as in v5c (raw ATD ball kick ends a wait); then each restart
   moves later to the ATD kick or the players clearly playing again (deadball.later_restarts); its team = the first
-  touch / hold after it (v5f, deadball.first_touch_team)
+  touch / hold after it (v5f, deadball.first_touch_team); the players' restart is ignored when ATD sees the ball within
+  deadball.ATD_GAP of the players' run start (v5i: ball still being placed, wait for its kick)
   (deadball.atd_fast / atd_kicker); the dead ball's start and open play keep our ball.
 - Submission: frames outside both halves (never scored) are D.
 
@@ -88,9 +89,12 @@ def half_sides(orig, h_first, h_last, teams, gk_slots):
 
 
 def kickoffs(d, tags, whistles, gk_slots):
-    """v3 kickoffs() plus src ('tag' / 'whistle'): tag windows as v3; whistle windows need the formation."""
-    out = [dict(k, src="tag") for k in V3.kickoffs(d, tags, d["home_left"], KICK_SPOT, closest=True)]
+    """v3 kickoffs() plus src ('tag' / 'whistle'): tag windows as v3; whistle windows need the formation at the kick;
+    tag windows (v5j) need it on at least one frame of the FORM_HOLD before the kick (a tag alone is not a kick-off)."""
     x = d["players_n"][:, :, 0] * P.PITCH[0]
+    out = [dict(k, src="tag") for k in V3.kickoffs(d, tags, d["home_left"], KICK_SPOT, closest=True)
+           if any(formation(x[i], d["teams"], gk_slots) == bool(d["home_left"][k["t"]])
+                  for i in range(max(k["t"] - FORM_HOLD, 0), k["t"] + 1))]
     f0 = d["frames"][0]
     for w in whistles:
         if any(a - TAG_LEAD <= w["a"] <= b + V3.KICK_MARGIN for _, a, b in tags):
@@ -101,6 +105,31 @@ def kickoffs(d, tags, whistles, gk_slots):
                     and not any(abs(k["t"] - o["t"]) < P.FPS for o in out):
                 out.append(dict(k, src="whistle", whistle=w["a"] - f0))
     return sorted(out, key=lambda k: k["t"])
+
+
+def kickoff_dead(dead, kicks, k0):
+    """v5j: an after-goal kick-off (after k0) ends any dead ball covering it (restart = the kick-off); with no dead ball
+    of at least deadball.WAIT ending at it, the dead ball runs from the end of the most recent one to the kick-off
+    (players' celebration and walk back after the goal), merged with it. Returns the new list."""
+    dead = sorted(dead, key=lambda x: x["s"])
+    for k in kicks:
+        t = k["t"]
+        if t <= k0:
+            continue
+        team = dict(team=k["team"], src="kick-off", to_mate=None)
+        dead = [dict(x, r=t, b=t - 1, **team) if x["s"] < t < x["r"] else x for x in dead]  # kick-off ends D
+        at = [x for x in dead if x["r"] == t]
+        if at and t - at[-1]["s"] >= DB.WAIT:
+            continue
+        dead = [x for x in dead if x["r"] != t]  # too short: part of the stoppage below
+        prev = [x for x in dead if x["r"] < t]
+        if prev:
+            p = prev[-1]
+            dead = [x for x in dead if x is not p] + [dict(p, r=t, b=t - 1, why=p["why"] + ", to kick-off", **team)]
+        else:
+            dead.append(dict(s=k0, r=t, a=k0, b=t - 1, why="to kick-off", keeper=False, **team))
+        dead.sort(key=lambda x: x["s"])
+    return dead
 
 
 def final_whistle(d, whistles):
@@ -162,6 +191,7 @@ def compute(first, last, track):
             else:
                 edges["end"] = (None, None, "no final whistle, no open wait")
     d["edges"] = edges
+    dead = kickoff_dead(dead, d["kickoffs"], k0)
     d["dead"] = [db for db in dead if db["r"] > k0 and db["s"] < end]
 
     inside = np.zeros(n + 1, bool)
@@ -213,5 +243,5 @@ if __name__ == "__main__":
     ap.add_argument("--track", default=os.path.join(P.MTAH, "data", "ball_classical", "out3", "tracked_11185_18684.csv"))
     ap.add_argument("--out-dir", default=os.path.join(P.MTAH, "data", "possession"))
     ap.add_argument("--no-dead-atd", action="store_true", help="v5: our ball inside dead balls too")
-    ap.add_argument("--tag", default="_v5f", help="suffix for the output names (keeps earlier outputs)")
+    ap.add_argument("--tag", default="_v5j", help="suffix for the output names (keeps earlier outputs)")
     main(ap.parse_args())

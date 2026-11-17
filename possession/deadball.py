@@ -153,8 +153,10 @@ def features(d):
         if "atd_ball" in d:  # a wait ends only on the ATD ball's kick or the players clearly playing again
             out["fast"] = atd_fast(d["atd_ball"] * P.PITCH)
             out["play"] = np.zeros(len(slow), bool)
+            seen = np.isfinite(d["atd_ball"]).all(1)
             for a, b in T.spans(pspeed >= PLAY_SPEED, 0):
-                if b - a + 1 >= PLAY_HOLD:
+                # v5i: ATD sees the ball within ATD_GAP of the run start (ball still placed): wait for its kick
+                if b - a + 1 >= PLAY_HOLD and not seen[max(a - ATD_GAP, 0):a + ATD_GAP + 1].any():
                     out["play"][a] = True
         return out
 
