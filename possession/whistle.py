@@ -1,28 +1,4 @@
-"""Referee whistle from the tactical video's audio track (dead-ball evidence for deadball.py).
-
-A referee whistle is two or more perfectly flat tones that start together (a multi-chamber whistle), about
-0.2-2 s long. Fans whistle too, but a fan's whistle is one tone that glides up and down (curved line in the
-spectrogram), and a crowd is many such lines starting at different times. So:
-
-1. Spectrogram (STFT, NPERSEG samples, hop HOP s) in FMIN..FMAX.
-2. Peaks: bins at least PROM dB above the local median of the spectrum (over +-MED_HZ) and a local maximum.
-3. Lines: peaks linked frame to frame when within LINK_REL of the line's last frequency (gaps <= GAP_HOPS hops).
-   A line is flat when it lasts >= MIN_DUR s and its frequency spread is <= FLAT_REL of its mean.
-4. Whistle: >= MIN_LINES flat lines whose onsets are within ONSET s of each other; start / end = earliest onset /
-   latest offset; freqs = the lines' mean frequencies. Whistles closer than MERGE s are one whistle.
-5. Referee, not fans: >= MIN_LINES of its tones within TONE_REL of the referee's tones REF_TONES. REF_TONES were
-   measured with steps 1-4 at kick-off whistles of the provided match, outside the public window.
-
-Pair detector (pair_whistles, used by possession_v5 through referee_whistles): the referee's whistle wobbles, fades
-and comes in short blasts, and its pitch moves with how hard it is blown (lower tone ~3.69-3.87 kHz), so tone
-following (steps 3-5) misses many. But both chambers move together: the RATIO of its two tones stays ~REF_TONES[1] /
-REF_TONES[0] (1.116). Fans: one tone (overtone at ratio 2).
-6. Every hop: score = max over peak pairs (lower peak in PAIR_LOW, upper peak at RATIO +- PAIR_TOL) of the weaker
-   peak's prominence.
-7. Whistle: hops with score >= PAIR_ON, gaps <= PAIR_GAP hops bridged, >= PAIR_MIN hops, loudest hop >= PAIR_PEAK.
-   PAIR_PEAK = the lowest value with no detection over the whole halftime (players off the pitch, fans whistling
-   at the same pitches); weaker real whistles are missed on purpose (no false positives).
-
+"""
 The audio is cut from the video with the ffmpeg binary bundled by imageio-ffmpeg and cached in ../data/audio/.
 
     python whistle.py --first 11185 --last 18684      # list whistles in a frame range

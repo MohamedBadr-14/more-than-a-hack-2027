@@ -1,31 +1,4 @@
-"""Team in possession per frame, v5: v4 plus the edges of each half (terms in ../GLOSSARY.md).
-
-Runs on any range inside one half (a whole half or a segment of it).
-- Referee whistles: whistle.referee_whistles (steps 1-5 or the pair detector).
-- Sides (which end HOME defends): from the players, not the tagging. Kick-off formation (goalkeeper slots left out,
-  ATD mixes them up): >= FORM_MIN outfield players seen per team, team means >= FORM_GAP apart, no player more than
-  FORM_SLACK into the other half (many stand on the halfway line). Sides of a half = the first formation held for
-  FORM_HOLD frames within FORM_SEARCH of the half's first frame (read from the ATD, whatever range is processed).
-- Kick-offs (v3 kick test with a wider spot: ball within KICK_SPOT of the centre spot, then KICK_AWAY from it; the
-  kick = where the ball is closest to the spot before it leaves, v3 kickoffs(closest=True)): searched inside each
-  smart tagging kick-off tag (as v3) and, for a referee whistle with no tag around it, from the whistle to
-  KICK_AFTER after it; a whistle kick-off also needs the kick-off formation at the kick.
-- Half start: when the range starts at the half's first frame, D up to the first kick-off; touches before it ignored.
-- Half end: when the range ends at the half's last frame, the final whistle = the first referee whistle after which
-  the players never play again (no run of median player speed >= deadball.SLOW with >= PLAY_MIN players seen, for
-  >= deadball.WAIT, that goes on past WH_LEAD after the whistle). D from the end of that whistle to the end of the half, whatever is touched.
-  No such whistle: a wait still open at the end of the half -> D from its dead-ball start (deadball.walk_back).
-- Dead ball (DEAD_ATD, v5e): the dead balls are found as in v5c (raw ATD ball kick ends a wait); then each restart
-  moves later to the ATD kick or the players clearly playing again (deadball.later_restarts); its team = the first
-  touch / hold after it (v5f, deadball.first_touch_team); the players' restart is ignored when ATD sees the ball within
-  deadball.ATD_GAP of the players' run start (v5i: ball still being placed, wait for its kick). v5k: only confirmed
-  outs count (deadball.confirmed_outs: depth on measured frames, ATD veto for the same ball / a raised long ball), and a
-  confirmed out going out is a dead ball by itself (deadball.out_dead_balls).
-- Kick-offs (v5j): tag kick-offs need the formation; a kick-off ends any dead ball over it; an after-goal kick-off with
-  no dead ball of >= deadball.WAIT before it gets D from the most recent dead ball (kickoff_dead).
-  (deadball.atd_fast / atd_kicker); the dead ball's start and open play keep our ball.
-- Submission: frames outside both halves (never scored) are D.
-
+"""
     python possession_v5.py --first 110808 --last 114500 --track ../data/ball_classical/seg_110808_114500/tracked_110808_114500.csv --tag _v5_seg
 """
 import argparse
@@ -151,7 +124,7 @@ def final_whistle(d, whistles):
 
 
 def compute(first, last, track, dead_track=None):
-    """possession_v4.compute()'s dict, with v5's whistles, sides, kick-offs and half edges (d['edges']).
+    """The possession dict, with v5's whistles, sides, kick-offs and half edges (d['edges']).
     dead_track (--dead-track, keeper catches): dead balls, whistles, kick-offs and half edges are those of `dead_track`
     (v5f on the track without --keeper-hold, exactly); only the touches (incl. keeper holds) come from `track`."""
     (h, h_first, h_last), = [blk for blk in half_video_blocks(P.GAME) if blk[1] <= first <= blk[2]]

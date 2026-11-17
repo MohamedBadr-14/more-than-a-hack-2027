@@ -1,33 +1,4 @@
-"""Dead ball (D): stoppages found from the restart backwards (used by possession_v4.py; terms in ../GLOSSARY.md).
-
-No smart tagging here (only the kick-off detection of possession_v3 uses its kick-off tags).
-
-1. Wait (the pause): players have slowed down (median player speed, 1 s mean, < SLOW) for >= WAIT frames, plus at
-   least one of
-   - ball still (ball speed, BALL_MEAN mean, < STILL),
-   - crowded end (>= CROWD players between one goal line and the 16.5 m line, full width: the corner shape, incl.
-     the taker and players beside the box; the ball is often tracked on feet there, so this does not need the ball),
-   - whistled: a referee whistle (whistle.py) ended at most WH_LEAD before the players' slow stretch began (or while
-     it was going on); the whole slow stretch after the whistle counts,
-   - outed: the ball was seen over a line (track.py "out") and no real kick happened since; the first slow stretch
-     after it counts, however long the players take to slow down (goal kicks: they jog back first).
-   A fast ball (>= FAST, measured: not an interpolated / carried ball, whose speed the tracker invents) ends a
-   wait: the restart kick. Corners: while the box is crowded, a ball inside that box is
-   players' feet (the tracker), not the ball: it neither ends the wait nor counts as the restart kick. After a
-   whistle or the ball out, only a real kick (touch "kick from slow" by one team) ends it: setting up, players
-   move / carry the ball.
-2. Restart = the first kick after the wait (a touch by one team within LOOK of the wait's end, not in the crowded box);
-   possession goes to the kicker's team from the kick. to_mate = the next touch / hold is a teammate's (a kick to an
-   opponent still gives the kicker's team the restart; the v3 rules change it after). Kick-off detected in the wait ->
-   the kick-off. No kick -> restart = frame after the wait, team = first hold within LOOK, else the team nearest the
-   ball, else no dead ball.
-4. Dead ball start, walking back from the wait start, after the last controlled sequence was confirmed (and after the
-   previous restart): the first frame the ball is beyond a line (seen out, or on the in -> out path, track.py); else
-   the frame after the end of the last referee whistle (whistle.py); else when play visibly stops: the start of the
-   ball-still run that leads into the wait, or the wait start (players slow), whichever is earlier. (Not the foul itself: dead ball starts
-   when play stops.) Late is safe: it only ends the previous spell late.
-5. Keeper: when the ball rests with a team's goalkeeper in its own box (a catch is in play), the dead ball needs a
-   ball seen over a line or a whistle (step 4).
+"""Dead ball (D): stoppages found from the restart backwards.
 """
 import warnings
 

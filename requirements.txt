@@ -1,10 +1,8 @@
-# Everything the evaluation needs. Deliberately two lines.
+# Tactinho submission: everything needed to regenerate Tactinho.csv and run the evaluation.
+# Tested with Python 3.13.5. Install with:  pip install -r requirements.txt
 #
-# The scorer is dependency-light on purpose: no sklearn, no torch, nothing that pins a Python
-# version. It runs under 3.8 and 3.11 alike and produces identical output, so "it scored
-# differently on my machine" is not a conversation anyone has to have.
-#
-# Optional tooling -- the ATD loader and anything that opens the video -- lives in
-# requirements-starter.txt.
-numpy
-pandas
+# The ball model pins (numpy, opencv-python, scikit-image, scikit-learn, scipy) live in
+# ball_classical/requirements.txt; scikit-learn must match to unpickle models/ball_svm.pkl.
+-r ball_classical/requirements.txt
+pandas==3.1.0
+imageio-ffmpeg==0.8.1

@@ -1,23 +1,4 @@
-"""Team in possession per frame, v3: hindsight rule on touches (touches.py).
-
-Dead ball is ignored: every frame after the first controlled sequence is H or A.
-
-0. Teams per frame (tagging.py): the ATD goalkeeper slot of a team standing in the half its team attacks is
-   the other team's keeper (ATD mixes them up) -> its team is switched on those frames. Ends per half come
-   from the smart tagging "Kick Off (Start)" tags.
-   Kick-off: inside each smart tagging kick-off tag (+ KICK_MARGIN), the kick = the last frame the ball is
-   within KICK_SPOT of the centre spot before it gets KICK_AWAY from it. Kicking team, two checks: the team
-   nearest the centre spot at the kick, and the team whose half the ball moves into (a kick-off goes back to
-   a teammate). Both agree -> possession is theirs from the kick; they disagree -> no kick-off state.
-1. Team events: touches (incl. far ones and ones flagged as a possible bounce) and holds of one team.
-   Contested and unknown events are skipped: they neither add to a sequence nor break it.
-2. Sequence: consecutive team events of one team, unbroken by an event of the other team. It is controlled
-   when it has >= MIN_TOUCHES touches or a hold.
-3. Possession stays with the current team (contested / loose balls included) until the other team has a
-   controlled sequence; it changes at that sequence's first event. A single touch that goes back to the old
-   team (deflection, failed tackle) is no change. No time limit between touches (dead ball comes later).
-   Before the first controlled sequence the label is X (the scorer back-fills it).
-
+"""
     python possession_v3.py                 # -> ../data/possession/possession_11185_18684_v3_r04_gap2{.csv,_submission.csv}
 """
 import argparse
@@ -141,7 +122,7 @@ def compute(first, last, track):
 
 
 def main(args, compute_fn=None, ungraded="X"):
-    """Writes the CSVs and prints a summary; compute_fn: a compute() with the same output (possession_v4);
+    """Writes the CSVs and prints a summary; compute_fn: a compute() with the same output (possession_v5);
     ungraded: label written on the frames outside both halves (never scored)."""
     d = (compute_fn or compute)(args.first, args.last, args.track)
     frames, labels, status, ev = d["frames"], d["labels"], d["status"], d["touches"]

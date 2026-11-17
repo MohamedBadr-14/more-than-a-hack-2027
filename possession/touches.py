@@ -1,30 +1,4 @@
 """Touches: moments a team plays the ball (step 1 of the touch-based possession logic, used by possession_v3.py).
-
-The ball's own path decides THAT something touched it; the players only decide WHO (ATD players are missing or
-off by ~0.5 m too often to gate on). Interpolated and carried balls are treated exactly like detections.
-
-0. Clean ball path: cut it where a step is impossible (> MAX_SPEED: ball in the air or tracker jump) or the source
-   switches to / from ATD (different ball, metres apart); smooth each piece over +-SMOOTH frames. Velocities are a
-   least-squares line through the window (one bad frame moves it little) and never cross a cut.
-1. Ball change per frame: velocity in = over the W frames before, out = over the W frames after. The frame fires
-   when any of:
-   - turn: direction changes >= TURN deg, ball moving >= MIN_SPEED m/s in and out (slower = angle is noise),
-     and the new direction holds over the next W frames too (a one-frame tracker jump does not)
-   - slow down: in >= SLOW_IN m/s and out <= SLOW_FRAC * in (reception, block)
-   - kick from slow: in < KICK_IN m/s and out >= KICK_OUT m/s
-   A fast ball speeding up in a straight line does not fire: a ball in the air does that on screen.
-2. Ball event: consecutive firing frames (holes <= BRIDGE) merged; its moment = the frame with the biggest
-   velocity change.
-3. Who: each team's nearest player over the event's frames.
-   - one team within R: that team's touch (both within R: the nearer one, unless the two are within
-     CONTEST_M of each other = contested, decided later by who comes out with the ball)
-   - nobody within R: the same with the wider R_FAR, marked far (player position off by a metre or two)
-   - nobody within R_FAR either: unknown, ignored (a bounce, a ball in the air, a missing player)
-4. Hold: one player (followed by position, slot ids swap) within R for >= HOLD frames. Also each keeper hold of
-   track.py --keeper-hold ("held" frames): a hold by the goalkeeper's team from the catch (keeper_holds()).
-5. Bounce flag (review only, possession still counts these touches): a ball in the air is placed on the pitch too far along the
-   camera's line of sight (the pitch direction of "up" in the image at the ball), so a bounce changes the
-   velocity along that line. Ball events whose velocity change is within BOUNCE_COS of it are flagged.
 """
 import numpy as np
 

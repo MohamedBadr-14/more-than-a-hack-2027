@@ -1,26 +1,3 @@
-"""Team in possession per frame: hand-over state machine on the classical ball + ATD players.
-
-Dead ball is ignored (v1): every frame after the first confirmed controller is H or A.
-
-1. Ball per frame: the classical tracker (ball_classical/track.py output, det or interp), else the ORIGINAL
-   ATD ball (Metrica, BAR-ATH_tactical_atd_original.txt -- the live file now carries our ball in this window).
-2. Near frame: the nearest player is within R of the ball and the nearest opponent is at least MARGIN
-   further away (closer = contested 50/50, no evidence). Control frame: a near frame where the ball moves
-   with him: |v_ball - v_player| < V_REL. Velocities are central differences over +/-VEL_HALF frames.
-3. Evidence: control frames where the ball is a tracked detection, a gap carried by one player (track.py), or
-   ATD fallback. Interpolated balls hold the state but never change it (their path is invented).
-4. State machine: possession stays with the current team until the other team has K evidence control
-   frames within the last M frames; the label switch is backdated to the start of the unbroken run of the
-   new team's near frames that holds the first of them (the ball reaching him, before he slows it).
-   Before the first confirmation the label is X (the scorer back-fills it).
-
-    python possession.py                  # 11185-18684 -> ../data/possession/possession_11185_18684.{csv,mp4}
-    python possession.py --no-video --tag _r2
-
-Video legend: team bar + label top left, GT (checking only) next to it. Players: dots by team, controller
-ringed (white ring = evidence frame, grey = interp frame), yellow X = contested. Ball: green = detection,
-orange = interpolated, cyan = attached to a carrier, magenta = ATD fallback.
-"""
 import argparse
 import csv
 import os
@@ -246,7 +223,7 @@ def main(args):
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap = argparse.ArgumentParser(description="Possession labels from the ball track")
     ap.add_argument("--first", type=int, default=11185)
     ap.add_argument("--last", type=int, default=18684)
     ap.add_argument("--track", default=os.path.join(MTAH, "data", "ball_classical", "strict_r04_gap2_carried", "tracked_11185_18684.csv"))
