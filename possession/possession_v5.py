@@ -213,5 +213,5 @@ if __name__ == "__main__":
     ap.add_argument("--track", default=os.path.join(P.MTAH, "data", "ball_classical", "out3", "tracked_11185_18684.csv"))
     ap.add_argument("--out-dir", default=os.path.join(P.MTAH, "data", "possession"))
     ap.add_argument("--no-dead-atd", action="store_true", help="v5: our ball inside dead balls too")
-    ap.add_argument("--tag", default="_v5h", help="suffix for the output names (keeps earlier outputs)")
+    ap.add_argument("--tag", default="_v5f", help="suffix for the output names (keeps earlier outputs)")
     main(ap.parse_args())

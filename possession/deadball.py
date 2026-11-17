@@ -50,7 +50,6 @@ WH_LEAD = 3 * P.FPS  # frames: players slowing down this soon after a referee wh
 ATD_GAP = P.FPS // 2  # frames, atd_fast(): longest gap between two ATD ball detections a speed is measured over
 PLAY_SPEED = 2.0  # m/s, ATD mode: median player speed (1 s mean) at or above this = players clearly playing again
 PLAY_HOLD = 2 * P.FPS  # frames the players must keep that speed
-ATD_OUT = 1.0     # m, atd_fast(): an ATD kick starts at most this far outside the lines
 FIRST_TOUCH = 5 * P.FPS  # frames after an ATD-mode restart searched for the first team touch (its team restarts)
 
 
@@ -118,21 +117,12 @@ def kicks(d, feet):
 
 def atd_fast(ball_m):
     """Bool per frame: the ATD ball (m, NaN where ATD has none) moves >= FAST between two of its own detections at
-    most ATD_GAP apart (no interpolation); flagged at the frame before the ball is first seen moved (the kick).
-    v5h: a fast run (consecutive fast steps) counts only when its first step starts on the pitch (within ATD_OUT of
-    the lines): a ball first seen already flying off the pitch is not a restart kick. All steps of a run that counts
-    are flagged (they also keep waits from forming during passes)."""
+    most ATD_GAP apart (no interpolation); flagged at the frame before the ball is first seen moved (the kick)."""
     out = np.zeros(len(ball_m), bool)
     idx = np.flatnonzero(np.isfinite(ball_m).all(1))
-    prev, valid = False, False  # the step before was fast (same run); the run started on the pitch
     for i, j in zip(idx[:-1], idx[1:]):
-        fast = j - i <= ATD_GAP and np.hypot(*(ball_m[j] - ball_m[i])) / (j - i) * P.FPS >= FAST
-        if fast and not prev:
-            x, y = ball_m[i]
-            valid = -ATD_OUT <= x <= P.PITCH[0] + ATD_OUT and -ATD_OUT <= y <= P.PITCH[1] + ATD_OUT
-        if fast and valid:
+        if j - i <= ATD_GAP and np.hypot(*(ball_m[j] - ball_m[i])) / (j - i) * P.FPS >= FAST:
             out[j - 1] = True
-        prev = fast
     return out
 
 
@@ -166,7 +156,6 @@ def features(d):
             for a, b in T.spans(pspeed >= PLAY_SPEED, 0):
                 if b - a + 1 >= PLAY_HOLD:
                     out["play"][a] = True
-            out["play"] &= ~np.isfinite(d["atd_ball"]).all(1)  # v5h: only while ATD has no ball (else its kick ends it)
         return out
 
 
@@ -320,8 +309,7 @@ def first_touch_team(d, r):
     """(team, why) of a restart at index r: the first team touch / hold within FIRST_TOUCH after it (our ball, open
     play: the ball is played to a teammate); else the player nearest the ATD ball if within touches.R; else (None, '')."""
     for e in d["touches"]:
-        if r <= e["t"] <= r + FIRST_TOUCH and e["kind"] in ("touch", "hold") and e["team"] in (P.HOME, P.AWAY) \
-                and not e.get("far"):  # v5h: a far touch (player beyond touches.R) is too weak to give the restart
+        if r <= e["t"] <= r + FIRST_TOUCH and e["kind"] in ("touch", "hold") and e["team"] in (P.HOME, P.AWAY):
             return e["team"], "first " + e["kind"]
     seen = np.flatnonzero(np.isfinite(d["atd_ball"][max(r - ATD_GAP, 0):r + 1]).all(1))
     if len(seen):
