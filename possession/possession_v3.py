@@ -28,11 +28,13 @@ import numpy as np
 
 import possession as P
 import tagging as TG
+from games import half_video_blocks
 import touches as T
 
 MIN_TOUCHES = 2
 KICK_SPOT = 2.0   # m, ball this close to the centre spot = on the spot
 KICK_AWAY = 5.0   # m, ball this far from the centre spot = kicked
+KICK_STILL = 0.5  # m, kickoffs(closest=True): ball this close to its nearest distance to the spot = not moving yet
 KICK_MARGIN = P.FPS  # frames searched after the end of a kick-off tag
 
 
@@ -48,9 +50,12 @@ def teams_per_frame(d, gk_slots, home_left):
     return teams_f
 
 
-def kickoffs(d, kicks, home_left):
+def kickoffs(d, kicks, home_left, spot=KICK_SPOT, closest=False):
     """[dict(t, near, into, team)] for the kick-off tags inside the window: t = the kick (index), near = team
-    nearest the centre spot, into = team whose half the ball moves into, team = both agree, else None."""
+    nearest the centre spot, into = team whose half the ball moves into, team = both agree, else None.
+    spot: ball this close to the centre spot = on the spot (possession_v5 passes a wider one).
+    closest: t = the last frame of the on-spot stretch before the kick where the ball is within KICK_STILL of its
+    closest distance to the spot (where it starts to move), not the last frame on the spot."""
     centre = np.array(P.PITCH) / 2
     ball, players = d["ball_n"] * P.PITCH, d["players_n"] * P.PITCH
     dist = np.hypot(*(ball - centre).T)
@@ -59,11 +64,17 @@ def kickoffs(d, kicks, home_left):
         lo, hi = max(a - f0, 0), min(b + KICK_MARGIN - f0, len(dist) - 1)
         if lo > hi:
             continue
-        on = [i for i in range(lo, hi + 1) if dist[i] <= KICK_SPOT]
+        on = [i for i in range(lo, hi + 1) if dist[i] <= spot]
         away = [i for i in range(on[0], hi + 1) if dist[i] >= KICK_AWAY] if on else []
         if not away:
             continue
         t = max(i for i in on if i < away[0])
+        if closest:
+            a0 = t
+            while a0 - 1 >= lo and dist[a0 - 1] <= spot:
+                a0 -= 1
+            near_min = np.nanmin(dist[a0:t + 1]) + KICK_STILL
+            t = max(i for i in range(a0, t + 1) if dist[i] <= near_min)
         dp = np.hypot(*(players[t] - centre).T)
         near = int(d["teams_f"][t, int(np.nanargmin(dp))])
         right = ball[away[0], 0] > centre[0]
@@ -129,8 +140,9 @@ def compute(first, last, track):
     return d
 
 
-def main(args, compute_fn=None):
-    """Writes the CSVs and prints a summary; compute_fn: a compute() with the same output (possession_v4)."""
+def main(args, compute_fn=None, ungraded="X"):
+    """Writes the CSVs and prints a summary; compute_fn: a compute() with the same output (possession_v4);
+    ungraded: label written on the frames outside both halves (never scored)."""
     d = (compute_fn or compute)(args.first, args.last, args.track)
     frames, labels, status, ev = d["frames"], d["labels"], d["status"], d["touches"]
     at = {}
@@ -146,7 +158,9 @@ def main(args, compute_fn=None):
             e = at.get(i)
             team = "" if e is None else {T.BOTH: "both", T.NONE: ""}.get(e["team"]) or P.LABEL[e["team"]]
             wr.writerow([t, labels[i], status[i], e["kind"] if e else "", team, int(e["far"]) if e else ""])
-    full = np.full(P.GAMES[P.GAME]["n_video_frames"], "X")
+    full = np.full(P.GAMES[P.GAME]["n_video_frames"], ungraded)
+    for _, a, b in half_video_blocks(P.GAME):
+        full[a:b + 1] = "X"
     full[frames] = labels
     with open(stem + "_submission.csv", "w", newline="") as f:
         f.write("frame,label\n")

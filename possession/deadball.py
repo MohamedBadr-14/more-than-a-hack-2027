@@ -47,6 +47,11 @@ BRIDGE = P.FPS // 2  # frames, holes this short inside a wait are bridged
 LOOK = 2 * P.FPS  # frames after the restart searched for the restart touch
 BOX_X, BOX_HALF_W = 16.5, 20.16  # m, penalty box depth and half width
 WH_LEAD = 3 * P.FPS  # frames: players slowing down this soon after a referee whistle = a whistled pause
+ATD_GAP = P.FPS // 2  # frames, atd_fast(): longest gap between two ATD ball detections a speed is measured over
+PLAY_SPEED = 2.0  # m/s, ATD mode: median player speed (1 s mean) at or above this = players clearly playing again
+PLAY_HOLD = 2 * P.FPS  # frames the players must keep that speed
+ATD_OUT = 1.0     # m, atd_fast(): an ATD kick starts at most this far outside the lines
+FIRST_TOUCH = 5 * P.FPS  # frames after an ATD-mode restart searched for the first team touch (its team restarts)
 
 
 def mean_1s(x, n=P.FPS):
@@ -111,9 +116,29 @@ def kicks(d, feet):
     return out
 
 
+def atd_fast(ball_m):
+    """Bool per frame: the ATD ball (m, NaN where ATD has none) moves >= FAST between two of its own detections at
+    most ATD_GAP apart (no interpolation); flagged at the frame before the ball is first seen moved (the kick).
+    v5h: a fast run (consecutive fast steps) counts only when its first step starts on the pitch (within ATD_OUT of
+    the lines): a ball first seen already flying off the pitch is not a restart kick. All steps of a run that counts
+    are flagged (they also keep waits from forming during passes)."""
+    out = np.zeros(len(ball_m), bool)
+    idx = np.flatnonzero(np.isfinite(ball_m).all(1))
+    prev, valid = False, False  # the step before was fast (same run); the run started on the pitch
+    for i, j in zip(idx[:-1], idx[1:]):
+        fast = j - i <= ATD_GAP and np.hypot(*(ball_m[j] - ball_m[i])) / (j - i) * P.FPS >= FAST
+        if fast and not prev:
+            x, y = ball_m[i]
+            valid = -ATD_OUT <= x <= P.PITCH[0] + ATD_OUT and -ATD_OUT <= y <= P.PITCH[1] + ATD_OUT
+        if fast and valid:
+            out[j - 1] = True
+        prev = fast
+    return out
+
+
 def features(d):
     """Per-frame arrays: pspeed, slow, bspeed, still, crowd (busiest end strip count), crowded, feet, whistled, kick, fast,
-    over_line."""
+    over_line. With d['atd_ball'] (possession_v5 DEAD_ATD): fast = atd_fast (a wait ends only on the ATD ball's kick)."""
     ball, players = d["ball_n"] * P.PITCH, d["players_n"] * P.PITCH
     pspeed = mean_1s(player_speed(players))
     speed = d["tinfo"]["speed"]
@@ -133,8 +158,16 @@ def features(d):
         held = wh | ob  # set-piece pauses: only a real kick ends them
         measured = ~np.isin(np.asarray(d["status"]), ["interp", "carried"])  # invented speeds never end a wait
         fast = ((speed >= FAST) & measured & ~feet & (~held | kick)) | (held & kick)  # whistle / out: a real kick
-        return dict(pspeed=pspeed, slow=slow, bspeed=bspeed, still=bspeed < STILL, crowd=crowd, crowded=crowded,
-                    feet=feet, whistled=wh, outed=ob, kick=kick, fast=fast, over_line=over_line)
+        out = dict(pspeed=pspeed, slow=slow, bspeed=bspeed, still=bspeed < STILL, crowd=crowd, crowded=crowded,
+                   feet=feet, whistled=wh, outed=ob, kick=kick, fast=fast, over_line=over_line)
+        if "atd_ball" in d:  # a wait ends only on the ATD ball's kick or the players clearly playing again
+            out["fast"] = atd_fast(d["atd_ball"] * P.PITCH)
+            out["play"] = np.zeros(len(slow), bool)
+            for a, b in T.spans(pspeed >= PLAY_SPEED, 0):
+                if b - a + 1 >= PLAY_HOLD:
+                    out["play"][a] = True
+            out["play"] &= ~np.isfinite(d["atd_ball"]).all(1)  # v5h: only while ATD has no ball (else its kick ends it)
+        return out
 
 
 def waits(ft):
@@ -186,6 +219,19 @@ def restart_team(d, r):
     return None, ""
 
 
+def atd_kicker(d, r):
+    """Team of the player nearest the ATD ball at index r (its last detection at or before r, the ball at rest), or
+    None."""
+    seen = np.flatnonzero(np.isfinite(d["atd_ball"][max(r - ATD_GAP, 0):r + 1]).all(1))
+    if not len(seen):
+        return None
+    b = d["atd_ball"][max(r - ATD_GAP, 0) + int(seen[-1])]
+    dist = np.hypot(*((d["players_n"][r] - b) * P.PITCH).T)
+    if np.all(np.isnan(dist)):
+        return None
+    return int(d["teams_f"][r, int(np.nanargmin(dist))])
+
+
 def walk_back(d, ft, a, floor):
     """(start index, why): dead ball start for a wait starting at a; floor = earliest allowed index."""
     lo = floor
@@ -220,6 +266,10 @@ def dead_balls(d, kickoffs, gk_slots, home_left):
         if kick:
             r = kick[0]["t"]
             team, src = kick[0]["team"], "kick-off"
+        elif "atd_ball" in d:  # the ATD ball's kick ends the wait: restart there, team nearest the ATD ball
+            team, src = (atd_kicker(d, r), "atd kick") if ft["fast"][r] else (None, "")
+            if team is None:
+                team, src = restart_team(d, r)
         elif fk is not None:
             r, team, to_mate = fk
             src = "kick"
@@ -235,4 +285,48 @@ def dead_balls(d, kickoffs, gk_slots, home_left):
             continue
         out.append(dict(s=s, r=r, a=a, b=b, team=team, src=src, why=why, keeper=keeper, to_mate=to_mate))
         floor = r
+    return later_restarts(d, ft, out) if "play" in ft else out
+
+
+def later_restarts(d, ft, dead):
+    """ATD mode (v5e): the dead balls stay the ones found above (same starts); each restart moves to the first ATD
+    kick or start of clearly playing again (ft 'play') from its wait's start, never earlier. A restart moved past the
+    next dead ball's start merges the two (one stoppage); a kick-off's restart is kept."""
+    stop, n, out = np.flatnonzero(ft["fast"] | ft["play"]), len(d["frames"]), []
+    for db in dead:
+        if db["src"] != "kick-off":
+            k = np.searchsorted(stop, db["a"])
+            r = int(stop[k]) if k < len(stop) else n - 1
+            if r > db["r"]:
+                team, src = (atd_kicker(d, r), "atd kick") if ft["fast"][r] else (None, "")
+                if team is None:
+                    team, src = restart_team(d, r)
+                if team is not None:
+                    db = dict(db, r=r, b=r - 1, team=team, src=src, to_mate=None)
+        if out and db["s"] < out[-1]["r"]:  # same stoppage
+            if db["src"] == "kick-off" or db["r"] > out[-1]["r"]:
+                out[-1] = dict(out[-1], r=db["r"], b=db["b"], team=db["team"], src=db["src"], to_mate=db["to_mate"])
+            continue
+        out.append(db)
+    for k, db in enumerate(out):  # v5f: the restart's team = the first touch after it, not the ATD kicker
+        if db["src"] != "kick-off":
+            team, why = first_touch_team(d, db["r"])
+            if team is not None:
+                out[k] = dict(db, team=team, src=("atd kick" if ft["fast"][db["r"]] else "players play") + ", " + why)
     return out
+
+
+def first_touch_team(d, r):
+    """(team, why) of a restart at index r: the first team touch / hold within FIRST_TOUCH after it (our ball, open
+    play: the ball is played to a teammate); else the player nearest the ATD ball if within touches.R; else (None, '')."""
+    for e in d["touches"]:
+        if r <= e["t"] <= r + FIRST_TOUCH and e["kind"] in ("touch", "hold") and e["team"] in (P.HOME, P.AWAY) \
+                and not e.get("far"):  # v5h: a far touch (player beyond touches.R) is too weak to give the restart
+            return e["team"], "first " + e["kind"]
+    seen = np.flatnonzero(np.isfinite(d["atd_ball"][max(r - ATD_GAP, 0):r + 1]).all(1))
+    if len(seen):
+        b = d["atd_ball"][max(r - ATD_GAP, 0) + int(seen[-1])]
+        dist = np.hypot(*((d["players_n"][r] - b) * P.PITCH).T)
+        if np.isfinite(dist).any() and np.nanmin(dist) <= T.R:
+            return int(d["teams_f"][r, int(np.nanargmin(dist))]), "nearest the ATD ball"
+    return None, ""

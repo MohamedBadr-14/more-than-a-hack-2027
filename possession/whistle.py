@@ -14,9 +14,20 @@ spectrogram), and a crowd is many such lines starting at different times. So:
    measured with steps 1-4 at the smart tagging kick-off whistles outside the public window (2nd half kick-off
    113707-113729: 3842-3870 / 4270-4278 Hz; after-goal kick-off 163072: 3781 / 4728 Hz).
 
+Pair detector (pair_whistles, used by possession_v5 through referee_whistles): the referee's whistle wobbles, fades
+and comes in short blasts, and its pitch moves with how hard it is blown (lower tone ~3.69-3.87 kHz), so tone
+following (steps 3-5) misses many. But both chambers move together: the RATIO of its two tones stays ~REF_TONES[1] /
+REF_TONES[0] (1.116). Fans: one tone (overtone at ratio 2).
+6. Every hop: score = max over peak pairs (lower peak in PAIR_LOW, upper peak at RATIO +- PAIR_TOL) of the weaker
+   peak's prominence.
+7. Whistle: hops with score >= PAIR_ON, gaps <= PAIR_GAP hops bridged, >= PAIR_MIN hops, loudest hop >= PAIR_PEAK.
+   PAIR_PEAK = the lowest value with no detection over the whole halftime (players off the pitch, fans whistling
+   at the same pitches); weaker real whistles are missed on purpose (no false positives).
+
 The audio is cut from the video with the ffmpeg binary bundled by imageio-ffmpeg and cached in ../data/audio/.
 
     python whistle.py --first 11185 --last 18684      # list whistles in a frame range
+    python whistle.py --first 11185 --last 18684 --pair   # referee whistles: steps 1-5 or the pair detector
 """
 import argparse
 import os
@@ -41,6 +52,14 @@ ONSET = 0.1             # s, onsets of a whistle's tones this close
 MERGE = 0.15            # s, whistles this close are one
 REF_TONES = (3830, 4275, 4730)  # Hz, the referee's whistle (see 5.)
 TONE_REL = 0.02
+PAIR_RATIO = REF_TONES[1] / REF_TONES[0]  # 1.116, the two chambers
+PAIR_TOL = 0.02         # relative
+PAIR_LOW = (3500, 4000)  # Hz, the lower tone
+PAIR_ON = 18.0          # dB, a hop counts
+PAIR_PEAK = 28.0        # dB, loudest hop of a whistle (halftime: no detection)
+PAIR_MIN = 10           # hops (0.1 s)
+PAIR_GAP = 5            # hops bridged
+PAIR_CHUNK = 60.0       # s of audio per STFT
 
 
 def audio(first, last):
@@ -117,11 +136,71 @@ def whistles(first, last):
     return merged
 
 
+def pair_score(x, sr):
+    """(hop times s, score dB) per hop: step 6."""
+    from scipy.ndimage import median_filter
+    from scipy.signal import stft
+    hop, n = int(round(HOP * sr)), int(PAIR_CHUNK * sr)
+    ts, sc = [], []
+    for s in range(0, len(x), n):
+        s0 = max(s - NPERSEG, 0)
+        f, t, Z = stft(x[s0:s + n + NPERSEG], sr, nperseg=NPERSEG, noverlap=NPERSEG - hop, boundary=None, padded=False)
+        band = (f >= 3200) & (f <= 4900)
+        f, S = f[band], 20 * np.log10(np.abs(Z[band]) + 1e-9)
+        prom = S - median_filter(S, size=(2 * int(MED_HZ / (f[1] - f[0])) + 1, 1), mode="nearest")
+        peak = (prom >= PAIR_ON / 2) & (S >= np.roll(S, 1, 0)) & (S >= np.roll(S, -1, 0))
+        t = t + s0 / sr
+        for k in np.flatnonzero((t >= s / sr) & (t < (s + n) / sr)):
+            pi = np.flatnonzero(peak[:, k])
+            best = 0.0
+            for i in pi[(f[pi] >= PAIR_LOW[0]) & (f[pi] <= PAIR_LOW[1])]:
+                m = np.abs(f[pi] / f[i] / PAIR_RATIO - 1) <= PAIR_TOL
+                if m.any():
+                    best = max(best, min(prom[i, k], prom[pi[m], k].max()))
+            ts.append(t[k])
+            sc.append(best)
+    return np.array(ts), np.array(sc)
+
+
+def pair_whistles(first, last):
+    """[dict(a, b, freqs=[], ref=True, src='pair')]: step 7."""
+    x, sr = audio(first, last)
+    t, s = pair_score(x, sr)
+    idx, spans = np.flatnonzero(s >= PAIR_ON), []
+    for i in idx:
+        if spans and i - spans[-1][1] <= PAIR_GAP + 1:
+            spans[-1][1] = i
+        else:
+            spans.append([i, i])
+    return [dict(a=first + int(round(t[a] * P.FPS)), b=first + int(round(t[b] * P.FPS)), freqs=[], ref=True, src="pair")
+            for a, b in spans if (s[a:b + 1] >= PAIR_ON).sum() >= PAIR_MIN and s[a:b + 1].max() >= PAIR_PEAK]
+
+
+def referee_whistles(first, last):
+    """Referee whistles from steps 1-5 (ref only) or the pair detector, merged when closer than MERGE."""
+    ws = [dict(w, src="tones") for w in whistles(first, last) if w["ref"]] + pair_whistles(first, last)
+    out = []
+    for w in sorted(ws, key=lambda w: w["a"]):
+        if out and w["a"] - out[-1]["b"] <= MERGE * P.FPS:
+            out[-1]["b"] = max(out[-1]["b"], w["b"])
+            out[-1]["freqs"] = sorted(set(out[-1]["freqs"]) | set(w["freqs"]))
+            out[-1]["src"] = "+".join(sorted(set(out[-1]["src"].split("+")) | {w["src"]}))
+        else:
+            out.append(dict(w))
+    return out
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--first", type=int, default=11185)
     ap.add_argument("--last", type=int, default=18684)
+    ap.add_argument("--pair", action="store_true", help="referee whistles incl. the pair detector")
     a = ap.parse_args()
-    for w in whistles(a.first, a.last):
-        print(f"whistle {w['a']}-{w['b']} ({(w['b'] - w['a']) / P.FPS:.2f} s) tones {w['freqs']} Hz -> "
-              + ("referee" if w["ref"] else "not the referee's tones"))
+    if a.pair:
+        for w in referee_whistles(a.first, a.last):
+            m, s = divmod(w["a"] / P.FPS, 60)
+            print(f"referee whistle {w['a']}-{w['b']} ({int(m)}:{s:04.1f}, {(w['b'] - w['a']) / P.FPS:.2f} s) by {w['src']}")
+    else:
+        for w in whistles(a.first, a.last):
+            print(f"whistle {w['a']}-{w['b']} ({(w['b'] - w['a']) / P.FPS:.2f} s) tones {w['freqs']} Hz -> "
+                  + ("referee" if w["ref"] else "not the referee's tones"))
